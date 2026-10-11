@@ -18,7 +18,7 @@ namespace frame_rate
     // com_maxfps: 0 is no limit, and 1000 is the most the title takes.
     inline uint32_t Limit()
     {
-        static const uint32_t limit = uint32_t(std::min<uint64_t>(env::Number("MW2_FPS_LIMIT", kConsole), 1000));
+        static const uint32_t limit = uint32_t(std::min<uint64_t>(env::Number("MW2_FPS_LIMIT", 120), 1000));
         return limit;
     }
 
