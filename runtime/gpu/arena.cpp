@@ -42,8 +42,23 @@ bool gpu::detail::ArenaProgress(uint32_t address, uint32_t value)
     const int32_t advance = int32_t(value - g_sequence);
     if (g_sequence && (advance <= 0 || advance > kMaxAdvance))
     {
-        g_havePosition = false;
-        return true;
+        // Check if the sequence counter was reset by the title (e.g. mission load,
+        // level transition, or counter wrap). Stale trailers from the circular arena
+        // ring are at most one lap behind (~64-128 sequence counts). A jump backwards
+        // of more than 128 (or restarting near 0) indicates a sequence counter reset.
+        const bool isReset = (advance < -128) || (value <= 32 && g_sequence > 64);
+        if (isReset)
+        {
+            LOGI("gpu: arena sequence reset detected (%u -> %u, advance=%d)",
+                 g_sequence, value, advance);
+        }
+        else
+        {
+            LOGI("gpu: arena dropped stale trailer (seq=%u, current=%u, advance=%d, pos=%08X)",
+                 value, g_sequence, advance, g_pendingPosition);
+            g_havePosition = false;
+            return true;
+        }
     }
     g_sequence = value;
     if (g_havePosition)
@@ -58,6 +73,36 @@ bool gpu::detail::ArenaProgress(uint32_t address, uint32_t value)
 void gpu::SetArenaProgressBlock(uint32_t address)
 {
     const uint32_t physical = kernel::ToPhysical(address);
-    if (g_block.exchange(physical, std::memory_order_relaxed) != physical)
+    const uint32_t prev = g_block.exchange(physical, std::memory_order_relaxed);
+    if (prev != physical)
+    {
         LOGI("gpu: arena progress block at %08X (physical %08X)", address, physical);
+        g_sequence = 0;
+        g_havePosition = false;
+        g_pendingPosition = 0;
+    }
 }
+
+uint32_t gpu::GetArenaProgressBlock()
+{
+    return g_block.load(std::memory_order_relaxed);
+}
+
+uint32_t gpu::GetArenaSequence()
+{
+    return g_sequence;
+}
+
+void gpu::ForceArenaProgress(uint32_t sequence, uint32_t position)
+{
+    const uint32_t block = g_block.load(std::memory_order_relaxed);
+    if (!block) return;
+    g_sequence = sequence;
+    g_havePosition = false;
+    g_pendingPosition = position;
+    WritePhysical(block + 4, position);
+    WritePhysical(block, sequence);
+    LOGW("gpu: forced arena progress block %08X to seq=%u, pos=%08X",
+         block, sequence, position);
+}
+

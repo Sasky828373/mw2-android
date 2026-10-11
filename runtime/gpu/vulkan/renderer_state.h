@@ -689,6 +689,7 @@ namespace vk::renderer::detail
     void TakeOptimisedPipelines();
     // Every finished frame, so the compiling waits while the world is drawn.
     void NoteFrame(bool world);
+    extern std::mutex g_pipelinesMutex;
     void StartPreparing();
     void StopPreparing();
     void ReportPreparing();
@@ -723,6 +724,9 @@ namespace vk::renderer::detail
     void SetCutsceneActive(bool active);
     void StartWarmupScheduler();
     void StopWarmupScheduler();
+    // Called by renderer_frame after each vkQueueSubmit so the warmup worker
+    // can throttle pipeline compilation during active rendering.
+    void NoteRenderSubmit();
 
     // ---- renderer_draw.cpp ----
     void ScissorOf(const gpu::RegisterFile& r, VkRect2D& scissor);

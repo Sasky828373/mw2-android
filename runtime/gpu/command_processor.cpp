@@ -249,6 +249,7 @@ namespace
     {
         if (!g.registers.InRange(index)) { g.registerWritesOutOfRange++; return; }
         g.registers.Write(index, value);
+        *GuestPtr<be32>(kRegisterAperture + index * 4) = value;
 
         // A scratch register whose bit is set in SCRATCH_UMSK is written back to
         // memory at SCRATCH_ADDR + 4n, as Xenia's command processor does. The
@@ -259,6 +260,36 @@ namespace
             const uint32_t n = index - kScratchReg0;
             const uint32_t umsk = RegisterOrAperture(kScratchUmsk);
             if (umsk & (1u << n)) WritePhysical(RegisterOrAperture(kScratchAddr) + n * 4, value);
+            return;
+        }
+
+        // When SCRATCH_UMSK is written, write back any scratch registers whose bit is set.
+        if (index == kScratchUmsk)
+        {
+            const uint32_t scratchAddr = RegisterOrAperture(kScratchAddr);
+            if (scratchAddr)
+            {
+                for (uint32_t n = 0; n < 8; n++)
+                {
+                    if (value & (1u << n))
+                        WritePhysical(scratchAddr + n * 4, g.registers[kScratchReg0 + n]);
+                }
+            }
+            return;
+        }
+
+        // When SCRATCH_ADDR is written, write back enabled scratch registers to the new address.
+        if (index == kScratchAddr)
+        {
+            const uint32_t umsk = RegisterOrAperture(kScratchUmsk);
+            if (value && umsk)
+            {
+                for (uint32_t n = 0; n < 8; n++)
+                {
+                    if (umsk & (1u << n))
+                        WritePhysical(value + n * 4, g.registers[kScratchReg0 + n]);
+                }
+            }
             return;
         }
 
@@ -521,9 +552,9 @@ namespace
         bool matched = false;
         constexpr auto kTimeout =
 #ifdef MW2_ANDROID
-            std::chrono::milliseconds(15000);
+            std::chrono::milliseconds(2000);
 #else
-            std::chrono::milliseconds(5000);
+            std::chrono::milliseconds(2000);
 #endif
         while (Running())
         {
@@ -827,7 +858,97 @@ namespace
             break;
         }
         const uint32_t used = before - s.remaining;
-        if (used < count) s.Skip(count - used);
+        if (used > count)
+        {
+            LOGE("pm4: opcode 0x%02X (%s) OVER-CONSUMED dwords: used %u > count %u",
+                 opcode, OpcodeName(opcode) ? OpcodeName(opcode) : "unknown", used, count);
+        }
+        else if (used < count)
+        {
+            s.Skip(count - used);
+        }
+    }
+
+    struct PacketTrace
+    {
+        uint32_t address;
+        uint32_t header;
+        uint8_t  type;
+        uint8_t  opcode;
+        uint16_t depth;
+        uint32_t payload;
+        uint32_t remaining;
+    };
+
+    constexpr size_t kTraceHistorySize = 64;
+    PacketTrace g_packetHistory[kTraceHistorySize]{};
+    size_t g_packetHistoryHead = 0;
+
+    void RecordPacket(uint32_t addr, uint32_t header, uint32_t type, uint32_t opcode, uint32_t payload, uint32_t remaining, int depth)
+    {
+        auto& t = g_packetHistory[g_packetHistoryHead % kTraceHistorySize];
+        t.address = addr;
+        t.header = header;
+        t.type = static_cast<uint8_t>(type);
+        t.opcode = static_cast<uint8_t>(opcode);
+        t.depth = static_cast<uint16_t>(depth);
+        t.payload = payload;
+        t.remaining = remaining;
+        g_packetHistoryHead++;
+    }
+
+    void DumpPacketHistory(int count = 16)
+    {
+        LOGW("pm4: dumping last %d executed packets prior to desync:", count);
+        const size_t total = g_packetHistoryHead;
+        const size_t start = (total > static_cast<size_t>(count)) ? (total - count) : 0;
+        for (size_t i = start; i < total; i++)
+        {
+            const auto& t = g_packetHistory[i % kTraceHistorySize];
+            const char* opName = (t.type == 3) ? OpcodeName(t.opcode) : nullptr;
+            LOGW("  [%zu] at %08X: header %08X (type %u%s%s, payload %u, rem %u, depth %d)",
+                 i, t.address, t.header, t.type,
+                 opName ? " " : "", opName ? opName : "",
+                 t.payload, t.remaining, t.depth);
+        }
+    }
+
+    void DumpMemoryWindow(uint32_t center)
+    {
+        LOGW("pm4: dumping memory around %08X:", center);
+        const uint32_t start = center >= 64 ? (center - 64) : 0;
+        const uint32_t end   = center + 64;
+        for (uint32_t a = start; a < end; a += 16)
+        {
+            LOGW("  %08X: %08X %08X %08X %08X %s",
+                 a,
+                 uint32_t(*GuestPtr<be32>(a)),
+                 uint32_t(*GuestPtr<be32>(a + 4)),
+                 uint32_t(*GuestPtr<be32>(a + 8)),
+                 uint32_t(*GuestPtr<be32>(a + 12)),
+                 (a <= center && center < a + 16) ? "<-- [packetAddr]" : "");
+        }
+    }
+
+    bool IsValidPacketHeader(uint32_t header, uint32_t remaining)
+    {
+        if (header == 0) return true;
+        const uint32_t type = header >> 30;
+        if (type == 2) return true;
+        if (type == 1) return remaining >= 2;
+        if (type == 0)
+        {
+            const uint32_t payload = ((header >> 16) & 0x3FFF) + 1;
+            const uint32_t reg = header & 0x7FFF;
+            return payload <= remaining && reg < 0x6000;
+        }
+        if (type == 3)
+        {
+            const uint32_t payload = ((header >> 16) & 0x3FFF) + 1;
+            const uint32_t opcode = (header >> 8) & 0x7F;
+            return payload <= remaining && OpcodeName(opcode) != nullptr;
+        }
+        return false;
     }
 
     void Execute(Source& s, int depth)
@@ -839,23 +960,91 @@ namespace
                 if (depth == 0) g.batchesAbandoned++;
                 return;
             }
+            const uint32_t packetAddr = s.AddressOf(s.index);
             const uint32_t header = s.Next();
             // A zero dword is filler, not a type-0 packet: reading it as one
             // swallows the dword after it.
-            if (header == 0) { g.padding++; continue; }
+            if (header == 0)
+            {
+                g.padding++;
+                static uint32_t zeroShown = 0;
+                if (zeroShown++ < 32)
+                    LOGW("pm4: zero dword (padding) at %08X, remaining %u, depth %d", packetAddr, s.remaining, depth);
+                continue;
+            }
 
             const uint32_t type = header >> 30;
             const uint32_t payload = (type == 1) ? 2
                                    : (type == 2) ? 0
                                    : ((header >> 16) & 0x3FFF) + 1;
-            if (payload > s.remaining)
+            const uint32_t opcode = (type == 3) ? ((header >> 8) & 0x7F) : 0xFF;
+            RecordPacket(packetAddr, header, type, opcode, payload, s.remaining, depth);
+            g_currentOpcode.store((type << 8) | (type == 3 ? opcode : 0), std::memory_order_relaxed);
+            g_currentOpcodeName.store(type == 3 ? OpcodeName(opcode) : (type == 0 ? "TYPE_0" : type == 1 ? "TYPE_1" : "TYPE_2"), std::memory_order_relaxed);
+            g_currentDepth.store(depth, std::memory_order_relaxed);
+
+            if (payload > s.remaining || (type == 3 && !OpcodeName(opcode)))
             {
-                s.lostStep = true;
                 static uint32_t shown = 0;
                 if (shown++ < 8)
-                    LOGW("pm4: a packet at %08X (header %08X) runs past the end of its buffer;"
-                         " the rest of the buffer is not read", s.AddressOf(s.index - 1), header);
-                return;
+                {
+                    LOGW("pm4: packet at %08X (header %08X, type %u, payload %u words, remaining %u words, depth %d) invalid; seeking next valid packet",
+                         packetAddr, header, type, payload, s.remaining, depth);
+                    DumpPacketHistory(16);
+                    DumpMemoryWindow(packetAddr);
+                }
+
+                bool recovered = false;
+                while (s.remaining > 0)
+                {
+                    const uint32_t candidateAddr = s.AddressOf(s.index);
+                    const uint32_t candidate = *GuestPtr<be32>(candidateAddr);
+                    if (candidate == 0)
+                    {
+                        s.Next();
+                        continue;
+                    }
+                    if (IsValidPacketHeader(candidate, s.remaining - 1))
+                    {
+                        if (shown <= 8)
+                        {
+                            LOGI("pm4: resynchronized at %08X with header %08X (rem %u)",
+                                 candidateAddr, candidate, s.remaining);
+                        }
+                        recovered = true;
+                        break;
+                    }
+                    s.Next();
+                }
+
+                if (!recovered)
+                {
+                    s.lostStep = true;
+                    // Scan remaining buffer words to salvage any trailing PM4_EVENT_WRITE_SHD packets
+                    // so guest D3D9 arena progress fences are never dropped, avoiding producer deadlocks.
+                    while (s.remaining >= 4)
+                    {
+                        const uint32_t w = s.Next();
+                        if ((w >> 30) == 3 && ((w >> 8) & 0x7F) == PM4_EVENT_WRITE_SHD)
+                        {
+                            const uint32_t count = ((w >> 16) & 0x3FFF) + 1;
+                            if (count >= 3 && s.remaining >= 3)
+                            {
+                                const uint32_t initiator = s.Next();
+                                const uint32_t address   = s.Next();
+                                const uint32_t value     = s.Next();
+                                vk::renderer::BeforeCompletion();
+                                if (!ArenaProgress(address, value))
+                                    WritePhysical(address, (initiator >> 31) ? uint32_t(PPC_QueryTimebase()) : value);
+                                LOGI("pm4: salvaged trailing EVENT_WRITE_SHD at %08X (addr %08X, val %08X)",
+                                     s.AddressOf(s.index - 4), address, value);
+                                if (count > 3) s.Skip(count - 3);
+                            }
+                        }
+                    }
+                    return;
+                }
+                continue;
             }
             g.typeCount[type]++;
             g.packets++;

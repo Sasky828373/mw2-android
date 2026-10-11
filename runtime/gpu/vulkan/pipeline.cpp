@@ -176,6 +176,23 @@ bool vk::pipeline::CreateDevice(void* physicalDevice, uint32_t family,
     // (Mali, etc.) require this feature to be explicitly enabled before creating BC images.
     enabled.textureCompressionBC = supported.textureCompressionBC;
     g.textureCompressionBC = supported.textureCompressionBC;
+    // Adreno's compressed-sampling path has a known BC1-with-1-bit-alpha flicker:
+    // surfaces sampling as black one frame and lit the next, missing geometry,
+    // and vertex garbage in vegetation. The screenshot ban against it is the
+    // same picture the Poco X6 Pro testers sent on Snapdragon devices that Mali
+    // phones never show. Mali keeps hardware BC; colour ranges, lighting and
+    // fog render identically with the hardware path there. Push Snapdragon
+    // devices to the software BC decoder, whose results are correct on both.
+    // MW2_FORCE_BC_HW=1 puts it back when a driver proves clean.
+    // The env flag is also available to users who hit this on another GPU vendor.
+    if (g.deviceProperties.vendorID == 0x5143 && supported.textureCompressionBC &&
+        !env::Flag("MW2_FORCE_BC_HW"))
+    {
+        enabled.textureCompressionBC = VK_FALSE;
+        g.textureCompressionBC = false;
+        LOGW("vulkan: Adreno BC sampling disabled (known black/missing-geometry flicker);"
+             " textures decode in software -- MW2_FORCE_BC_HW=1 re-enables hardware BC");
+    }
     if (!supported.textureCompressionBC)
         LOGW("vulkan: the device does not report textureCompressionBC support");
     // The title's occlusion queries are a sample count it compares against a
@@ -198,6 +215,27 @@ bool vk::pipeline::CreateDevice(void* physicalDevice, uint32_t family,
     std::vector<const char*> extensions(extraExtensions, extraExtensions + extraCount);
     if (DeviceHasExtension(physical, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME))
         extensions.push_back(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
+    // MSAA depth surfaces are read back through a render pass resolve. That is
+    // core in Vulkan 1.2 but an extension before it, so a 1.1-or-1.0 device
+    // has to be asked for it by name -- its presence is what renderer.cpp
+    // gates multisampling on.
+    {
+        VkPhysicalDeviceProperties check{};
+        vkGetPhysicalDeviceProperties(physical, &check);
+        if (check.apiVersion < VK_API_VERSION_1_2 &&
+            DeviceHasExtension(physical, VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME))
+            extensions.push_back(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
+        // The depth resolve's own query goes through GetPhysicalDevice*
+        // Properties2, and the 1.1 promoted Maintenance1 is where negative
+        // viewport heights (the renderer's flipped clip space) live.
+        if (check.apiVersion < VK_API_VERSION_1_1)
+        {
+            if (DeviceHasExtension(physical, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
+                extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+            if (DeviceHasExtension(physical, VK_KHR_MAINTENANCE1_EXTENSION_NAME))
+                extensions.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
+        }
+    }
 
     // Direct3D 9 filters each cube face on its own, clamped at its edges; a
     // Vulkan cube blends across them unless told not to. Xenia asks for the
@@ -359,14 +397,15 @@ namespace
 
         VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
         app.pApplicationName = "mw2recomp";
-        // 1.1 for negative viewport heights, which is how the renderer expresses the
-        // console's +Y-up clip space; 1.2 for the render pass depth resolve the
-        // multisampled surfaces need.
-        // The highest the loader will admit to, capped at 1.3. It matters:
-        // dynamic rendering and extended dynamic state are core there, and
-        // a driver that has them in core rather than as extensions can only
-        // be asked for them by an application that says it targets 1.3.
-        app.apiVersion = VK_API_VERSION_1_2;
+        // 1.0 is the floor: negative viewport heights (VK_KHR_maintenance1
+        // before that) and still-valid depth resolves (VK_KHR_get_*2 and
+        // VK_KHR_depth_stencil_resolve) are all extensions, and the top of the
+        // device's version is checked in CreateDevice regardless. The highest
+        // the loader will admit to, capped at 1.3: dynamic rendering and
+        // extended dynamic state are core there, and a driver that has them
+        // in core rather than as extensions can only be asked for them by an
+        // application that says it targets 1.3.
+        app.apiVersion = VK_API_VERSION_1_0;
 #if defined(MW2_VULKAN_DYNAMIC)
         if (vkEnumerateInstanceVersion)
 #endif
@@ -379,8 +418,35 @@ namespace
             }
         }
 
+        // A 1.0 instance has to name what 1.1 and 1.2 make core, because the
+        // runtime asks for negative viewport heights (maintenance1) and for
+        // the pNext-chain properties2 the depth resolve read goes through.
+        std::vector<const char*> instanceExtensions;
+        if (app.apiVersion < VK_API_VERSION_1_1)
+        {
+            uint32_t offered = 0;
+            if (vkEnumerateInstanceExtensionProperties(nullptr, &offered, nullptr) == VK_SUCCESS && offered)
+            {
+                std::vector<VkExtensionProperties> list(offered);
+                if (vkEnumerateInstanceExtensionProperties(nullptr, &offered, list.data()) == VK_SUCCESS)
+                {
+                    const auto have = [&list](const char* name) {
+                        for (const auto& e : list)
+                            if (std::strcmp(e.extensionName, name) == 0) return true;
+                        return false;
+                    };
+                    if (have(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
+                        instanceExtensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+                    if (have(VK_KHR_MAINTENANCE1_EXTENSION_NAME))
+                        instanceExtensions.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
+                }
+            }
+        }
+
         VkInstanceCreateInfo info{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
         info.pApplicationInfo = &app;
+        info.enabledExtensionCount = uint32_t(instanceExtensions.size());
+        info.ppEnabledExtensionNames = instanceExtensions.data();
         VkResult r = vkCreateInstance(&info, nullptr, &g.instance);
         if (r != VK_SUCCESS) { LOGW("pipeline: no Vulkan instance (%s)", Explain(r)); return false; }
 #if defined(MW2_VULKAN_DYNAMIC)
@@ -528,65 +594,100 @@ namespace
         uint64_t dataSize = 0;
     };
 
+    // Whether this GPU's VkPipelineCache is persisted to disk across sessions.
+    // Mali has historically had driver bugs with cross-session cache blobs, so we
+    // create and use the cache within a session (which allows ISA reuse between
+    // pipelines that share shaders) but do not save it to disk for Mali.
+    bool IsMali() { return g.deviceProperties.vendorID == 0x13B5; }
+
+    // Whether this GPU's VkPipelineCache is persisted to disk across sessions.
+    // Mali has historically had driver bugs with cross-session cache blobs, so
+    // we create and use the cache within a session (which allows ISA reuse
+    // between pipelines that share shaders) but do not save it to disk by
+    // default. MW2_PERSIST_PIPELINE_CACHE=1 overrides: the test reports of
+    // Poco X6 Pro (Mali-G615, driver 1.3.247) show every run recompiling
+    // hundreds of pipelines at 300-464 ms as the training level loads, which
+    // is what stalls the GPU thread behind its guest waits long enough for
+    // the title to error out -- worth a player let-in even against the
+    // historical driver bug. If the driver rejects a loaded blob, CreateCache
+    // logs it and falls back to an empty cache, so the failure is soft.
+    bool PersistCache()
+    {
+        static const bool asked = env::Flag("MW2_PERSIST_PIPELINE_CACHE");
+        if (asked) LOGI("pipeline: persisting the pipeline cache across runs (user request) on %04X", g.deviceProperties.vendorID);
+        return !IsMali() || asked;
+    }
+
     void CreateCache()
     {
         std::lock_guard lock(vk::pipeline::CacheMutex());
-        if (g.deviceProperties.vendorID == 0x13B5 || env::Flag("MW2_NO_PIPELINE_CACHE"))
+        if (env::Flag("MW2_NO_PIPELINE_CACHE"))
         {
-            LOGI("pipeline: persistent VkPipelineCache bypassed (ARM Mali GPU %04X or MW2_NO_PIPELINE_CACHE)",
-                 g.deviceProperties.vendorID);
+            LOGI("pipeline: VkPipelineCache bypassed (MW2_NO_PIPELINE_CACHE)");
             return;
         }
 
         std::vector<uint8_t> initial;
-        if (const char* path = CachePath())
+        // Mali: skip disk-load by default to avoid cross-session driver
+        // instability, but still create an in-session cache for ISA reuse.
+        // MW2_PERSIST_PIPELINE_CACHE=1 asks for the disk blob back (see
+        // PersistCache above).
+        if (PersistCache())
         {
-            LOGI("pipeline: checking persistent pipeline cache at: %s", path);
-            if (std::FILE* f = std::fopen(path, "rb"))
+            if (const char* path = CachePath())
             {
-                std::fseek(f, 0, SEEK_END);
-                const long fileSize = std::ftell(f);
-                std::fseek(f, 0, SEEK_SET);
-
-                if (fileSize > (long)sizeof(PipelineCacheHeader) && fileSize <= 64 * 1024 * 1024)
+                LOGI("pipeline: checking persistent pipeline cache at: %s", path);
+                if (std::FILE* f = std::fopen(path, "rb"))
                 {
-                    PipelineCacheHeader header{};
-                    if (std::fread(&header, sizeof(header), 1, f) == 1)
-                    {
-                        const bool valid = (header.magic == 0x32435056 &&
-                                            header.version == 1 &&
-                                            header.vendorID == g.deviceProperties.vendorID &&
-                                            header.deviceID == g.deviceProperties.deviceID &&
-                                            header.driverVersion == g.deviceProperties.driverVersion &&
-                                            std::memcmp(header.pipelineCacheUUID, g.deviceProperties.pipelineCacheUUID, VK_UUID_SIZE) == 0 &&
-                                            header.dataSize == (uint64_t)(fileSize - sizeof(PipelineCacheHeader)));
+                    std::fseek(f, 0, SEEK_END);
+                    const long fileSize = std::ftell(f);
+                    std::fseek(f, 0, SEEK_SET);
 
-                        if (valid)
+                    if (fileSize > (long)sizeof(PipelineCacheHeader) && fileSize <= 64 * 1024 * 1024)
+                    {
+                        PipelineCacheHeader header{};
+                        if (std::fread(&header, sizeof(header), 1, f) == 1)
                         {
-                            initial.resize(header.dataSize);
-                            if (std::fread(initial.data(), 1, header.dataSize, f) == header.dataSize)
+                            const bool valid = (header.magic == 0x32435056 &&
+                                                header.version == 1 &&
+                                                header.vendorID == g.deviceProperties.vendorID &&
+                                                header.deviceID == g.deviceProperties.deviceID &&
+                                                header.driverVersion == g.deviceProperties.driverVersion &&
+                                                std::memcmp(header.pipelineCacheUUID, g.deviceProperties.pipelineCacheUUID, VK_UUID_SIZE) == 0 &&
+                                                header.dataSize == (uint64_t)(fileSize - sizeof(PipelineCacheHeader)));
+
+                            if (valid)
                             {
-                                LOGI("pipeline: verified valid cache header for GPU %04X:%04X driver %08X (%zu KB payload)",
-                                     header.vendorID, header.deviceID, header.driverVersion, initial.size() / 1024);
+                                initial.resize(header.dataSize);
+                                if (std::fread(initial.data(), 1, header.dataSize, f) == header.dataSize)
+                                {
+                                    LOGI("pipeline: verified valid cache header for GPU %04X:%04X driver %08X (%zu KB payload)",
+                                         header.vendorID, header.deviceID, header.driverVersion, initial.size() / 1024);
+                                }
+                                else
+                                {
+                                    initial.clear();
+                                    LOGW("pipeline: truncated cache payload in %s, starting empty", path);
+                                }
                             }
                             else
                             {
-                                initial.clear();
-                                LOGW("pipeline: truncated cache payload in %s, starting empty", path);
+                                LOGW("pipeline: cache header in %s invalidated (driver/device update or UUID mismatch), starting fresh", path);
                             }
                         }
-                        else
-                        {
-                            LOGW("pipeline: cache header in %s invalidated (driver/device update or UUID mismatch), starting fresh", path);
-                        }
                     }
+                    else if (fileSize > 0)
+                    {
+                        LOGW("pipeline: cache file %s size invalid (%ld bytes), ignoring", path, fileSize);
+                    }
+                    std::fclose(f);
                 }
-                else if (fileSize > 0)
-                {
-                    LOGW("pipeline: cache file %s size invalid (%ld bytes), ignoring", path, fileSize);
-                }
-                std::fclose(f);
             }
+        }
+        else
+        {
+            LOGI("pipeline: Mali GPU detected -- using in-session VkPipelineCache only;"
+                 " set MW2_PERSIST_PIPELINE_CACHE=1 to keep the disk blob across runs");
         }
 
         VkPipelineCacheCreateInfo info{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
@@ -608,6 +709,9 @@ namespace
     void SaveCache()
     {
         std::lock_guard lock(vk::pipeline::CacheMutex());
+        // Do not persist cache blobs to disk on Mali by default --
+        // in-session use only. MW2_PERSIST_PIPELINE_CACHE=1 keeps saving.
+        if (!PersistCache()) return;
         const char* path = CachePath();
         if (!path || !g.cache) return;
         size_t size = 0;
@@ -747,7 +851,8 @@ void*    vk::pipeline::SetLayout(uint32_t set) { return set < 3 ? g.sets[set] : 
 void*    vk::pipeline::Layout() { return g.layout; }
 void*    vk::pipeline::Cache()
 {
-    if (g.deviceProperties.vendorID == 0x13B5) return nullptr; // ARM Mali
+    // Mali: return the handle for in-session ISA reuse.
+    // (Not persisted to disk -- see SaveCache above.)
     static const bool noCache = env::Flag("MW2_NO_PIPELINE_CACHE");
     if (noCache) return nullptr;
     return g.cache;
