@@ -333,8 +333,8 @@ class GameActivity : AppCompatActivity(), NativeListener {
         // to prevent erratic thermal throttling mid-gameplay.
         window.setSustainedPerformanceMode(true)
         // Request 120 Hz for the 120 FPS native rendering path.
-        // Keep the legacy 60 Hz preference as an explicit opt-in.
-        val targetHz = if (prefs.prefer60Hz) 60f else 120f
+        // Always request 120 Hz, including on upgrades with a saved 60 Hz preference.
+        val targetHz = 120f
         val attributes = window.attributes
         attributes.preferredRefreshRate = targetHz
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
