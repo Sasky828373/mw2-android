@@ -332,24 +332,25 @@ class GameActivity : AppCompatActivity(), NativeListener {
         // Sustained performance mode locks CPU/GPU governors to steady frequencies
         // to prevent erratic thermal throttling mid-gameplay.
         window.setSustainedPerformanceMode(true)
-        if (prefs.prefer60Hz) {
-            val attributes = window.attributes
-            attributes.preferredRefreshRate = 60f
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                val displayObj = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display
-                else {
-                    @Suppress("DEPRECATION")
-                    windowManager.defaultDisplay
-                }
-                if (displayObj != null) {
-                    val mode60 = displayObj.supportedModes.firstOrNull { kotlin.math.abs(it.refreshRate - 60f) < 1f }
-                    if (mode60 != null) {
-                        attributes.preferredDisplayModeId = mode60.modeId
-                    }
-                }
+        // Request 120 Hz for the 120 FPS native rendering path.
+        // Keep the legacy 60 Hz preference as an explicit opt-in.
+        val targetHz = if (prefs.prefer60Hz) 60f else 120f
+        val attributes = window.attributes
+        attributes.preferredRefreshRate = targetHz
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val displayObj = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) display
+            else {
+                @Suppress("DEPRECATION")
+                windowManager.defaultDisplay
             }
-            window.attributes = attributes
+            val matchingMode = displayObj?.supportedModes?.firstOrNull {
+                kotlin.math.abs(it.refreshRate - targetHz) < 1f
+            }
+            if (matchingMode != null) {
+                attributes.preferredDisplayModeId = matchingMode.modeId
+            }
         }
+        window.attributes = attributes
 
         vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
