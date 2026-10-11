@@ -59,7 +59,7 @@ class Prefs(context: Context) {
      * frame pacing, thermal throttling, and excessive battery drain.
      */
     var prefer60Hz: Boolean
-        get() = store.getBoolean(KEY_60HZ, true)
+        get() = store.getBoolean(KEY_60HZ, false)
         set(value) = store.edit().putBoolean(KEY_60HZ, value).apply()
 
     /**
