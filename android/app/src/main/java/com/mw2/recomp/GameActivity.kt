@@ -679,6 +679,7 @@ class GameActivity : AppCompatActivity(), NativeListener {
     private fun applyOptions() {
         // Everything here is one of the runtime's own switches
         // (docs/switches.md); the app just fills them in.
+        NativeBridge.nativeSetOption("MW2_FPS_LIMIT", "120")
         NativeBridge.nativeSetOption("MW2_FULLSCREEN", "1")
         NativeBridge.nativeSetOption("MW2_NO_AUDIO", if (prefs.audioEnabled) "" else "1")
         NativeBridge.nativeSetOption("MW2_NO_MSAA", if (prefs.multisampling) "" else "1")
