@@ -237,7 +237,11 @@ namespace vk::renderer::detail
         Stopwatch waited(g.fenceNanoseconds);
         stutters::Timed timed(stutters::kGpuWaits);
         vk::record::WaitFor(slot.queuedAt);
-        VkResult res = vkWaitForFences(g.device, 1, &slot.fence, VK_TRUE, 2000000000ull);
+        // Most slots have completed by the time we recycle them. Query first
+        // to avoid a blocking driver wait on the normal fast path.
+        VkResult res = vkGetFenceStatus(g.device, slot.fence);
+        if (res == VK_NOT_READY)
+            res = vkWaitForFences(g.device, 1, &slot.fence, VK_TRUE, 2000000000ull);
         if (res == VK_TIMEOUT)
         {
             LOGW("renderer: waiting for %s took >2 seconds; waiting up to 5s...", what);
