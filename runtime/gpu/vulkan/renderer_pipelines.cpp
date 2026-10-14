@@ -377,10 +377,19 @@ namespace vk::renderer::detail
                               bool* made)
     {
         TakeOptimisedPipelines();
+        // Serialize cache misses between the warmup worker and the gameplay
+        // thread. Without this, both can compile the same pipeline, overwrite
+        // the cached handle and leak GPU/driver objects under heavy misses.
+        static std::mutex compileMutex;
+        std::lock_guard compileLock(compileMutex);
         {
             std::lock_guard lock(g_pipelinesMutex);
             auto found = g.pipelines.find(key);
-            if (found != g.pipelines.end()) return found->second;
+            if (found != g.pipelines.end())
+            {
+                if (made) *made = false;
+                return found->second;
+            }
         }
 
         if (made) *made = true;
