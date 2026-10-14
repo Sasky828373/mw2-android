@@ -25,7 +25,13 @@ namespace vk::renderer::detail
     void RetireBeforeDestroy()
     {
         const bool wasRecording = g.recording;
-        if (wasRecording) Submit(true);
+        if (wasRecording && !Submit(true))
+        {
+            // Do not retire or destroy resources when the GPU has not
+            // confirmed completion of the command buffer referencing them.
+            LOGE("renderer: cannot retire resources after failed frame submission");
+            return;
+        }
         vk::record::Drain();
         // Retire the renderer's known submissions using their per-slot fences.
         // Avoid a device-wide stall in the normal destruction path; presenter
