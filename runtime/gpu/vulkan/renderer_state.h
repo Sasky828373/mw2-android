@@ -637,7 +637,7 @@ namespace vk::renderer::detail
     uint64_t CompletedSerial();
     void NoteCompleted();
     // Destroying an image the GPU may still use.
-    void RetireBeforeDestroy();
+    bool RetireBeforeDestroy();
     // Until the GPU has finished the submission a slot holds, if it holds one.
     bool WaitForSlot(State::Slot& slot, const char* what);
     void FinishFrame(VkImage present);

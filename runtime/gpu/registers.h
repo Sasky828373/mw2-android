@@ -349,6 +349,12 @@ namespace gpu
 
         void Write(uint32_t index, uint32_t value)
         {
+            // Repeated PM4 register writes are extremely common. Invalidating
+            // the 4 KB constant-window cache for an identical value needlessly
+            // copies uniforms into the upload arena on later draws. Side
+            // effects (scratch writebacks, LUT updates) still happen in the
+            // command processor's WriteRegister, independent of these stamps.
+            if (values[index] == value) return;
             values[index] = value;
             stamps[index >> kStampShift] = ++writes;
         }

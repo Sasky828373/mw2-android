@@ -63,7 +63,7 @@ namespace vk::renderer::detail
         // Rare -- a resolve destination that has to grow -- and both a submitted
         // slot and the buffer being recorded may still name the image being
         // replaced.
-        if (into.image) RetireBeforeDestroy();
+        if (into.image && !RetireBeforeDestroy()) return false;
         // The texture cache has built sets on these views. Its own check -- the
         // view behind an id changed -- misses a replacement that gets the old
         // handle back, and a set on the freed image is a texture read of unbacked

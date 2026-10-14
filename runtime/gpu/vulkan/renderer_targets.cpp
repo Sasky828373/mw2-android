@@ -403,7 +403,11 @@ namespace vk::renderer::detail
         if (found != g.targets.end())
         {
             // The surface grew. Rare enough to rebuild rather than plan for.
-            RetireBeforeDestroy();
+            if (!RetireBeforeDestroy())
+            {
+                Skip("cannot retire old render target");
+                return nullptr;
+            }
             DestroyTarget(found->second);
             width = std::min(2048u, std::max(width, found->second.width));
             height = std::min(2048u, std::max(height, found->second.height));

@@ -22,7 +22,7 @@ namespace vk::renderer::detail
     // buffer is finished and waited for first, and a fresh one is begun if the
     // caller was in the middle of recording. Commands the recorder thread has
     // not made yet name it too, so it is waited for as well.
-    void RetireBeforeDestroy()
+    bool RetireBeforeDestroy()
     {
         const bool wasRecording = g.recording;
         if (wasRecording && !Submit(true))
@@ -30,7 +30,7 @@ namespace vk::renderer::detail
             // Do not retire or destroy resources when the GPU has not
             // confirmed completion of the command buffer referencing them.
             LOGE("renderer: cannot retire resources after failed frame submission");
-            return;
+            return false;
         }
         vk::record::Drain();
         // Retire the renderer's known submissions using their per-slot fences.
@@ -46,10 +46,12 @@ namespace vk::renderer::detail
             // Only this exceptional recovery path waits for the whole device.
             if (vk::pipeline::Failed(vkDeviceWaitIdle(g.device),
                                      "device idle after a retirement fence failure"))
-                return;
+                return false;
             for (State::Slot& slot : g.slots) slot.inFlight = false;
         }
-        if (wasRecording) BeginFrame();
+        // Report failure to the caller: it must not free still-live images.
+        if (wasRecording && !BeginFrame()) return false;
+        return true;
     }
 
     bool BeginFrame()
