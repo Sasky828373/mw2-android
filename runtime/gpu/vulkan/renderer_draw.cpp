@@ -652,16 +652,14 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
 #endif
     if (newPipeline && ShaderCachePath())
     {
+        // Record the recipe now, but never synchronously serialize every
+        // shader plus the driver's pipeline cache in the middle of a draw.
+        // FinishFrame checkpoints recipes during non-world frames; Shutdown
+        // persists any remaining entries even after continuous gameplay.
         g.recorded.push_back({ key.vertexShader, key.pixelShader,
                                uint32_t(colourTarget->format), uint32_t(depthTarget->format),
                                key.topology, depthControl, key.blendControl,
                                key.colourMask, modeCntl, key.samples });
-        static uint32_t s_lastSaved = 0;
-        if (g.recorded.size() - s_lastSaved >= 32)
-        {
-            s_lastSaved = uint32_t(g.recorded.size());
-            WriteShaderCache();
-        }
     }
 
     // Cull fully clipped draws before texture uploads and descriptor allocation.

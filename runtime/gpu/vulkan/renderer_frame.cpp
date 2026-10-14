@@ -341,6 +341,25 @@ namespace vk::renderer::detail
         report::Frame(worldDrawn);
         NoteFrame(worldDrawn);
         SetCutsceneActive(!worldDrawn);
+        // The shader recipe and driver cache were previously serialized from
+        // Draw() after every few misses, stalling a world frame on disk IO
+        // and VkPipelineCache serialization. Persist only on non-world frames
+        // and at most once per five seconds; Shutdown always writes the rest.
+        // No extra thread touches the renderer's shader map during this call.
+        if (!worldDrawn && ShaderCachePath() && !g.recorded.empty())
+        {
+            static size_t lastSavedRecipes = 0;
+            static auto lastSavedAt = std::chrono::steady_clock::time_point{};
+            const auto now = std::chrono::steady_clock::now();
+            if (g.recorded.size() >= lastSavedRecipes + 32 &&
+                (lastSavedAt == std::chrono::steady_clock::time_point{} ||
+                 now - lastSavedAt >= std::chrono::seconds(5)))
+            {
+                WriteShaderCache();
+                lastSavedRecipes = g.recorded.size();
+                lastSavedAt = now;
+            }
+        }
         if (worldDrawn)
         {
             const auto now = std::chrono::steady_clock::now();
