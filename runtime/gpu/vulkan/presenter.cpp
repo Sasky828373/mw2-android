@@ -433,8 +433,23 @@ namespace
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         vkGetPhysicalDeviceSurfaceFormatsKHR(g.physical, g.surface, &formatCount, formats.data());
         VkSurfaceFormatKHR chosen = formats[0];
+#ifdef MW2_ANDROID
+        // The renderer hands the presenter RGBA8. On a panel advertising an
+        // RGBA8 swapchain, keeping that format avoids BGRA conversion on each
+        // frame's transfer and enables the exact-size vkCmdCopyImage path.
+        // Fall back to the original BGRA8 preference when RGBA8 is absent.
+        bool foundNative = false;
         for (const auto& f : formats)
-            if (f.format == VK_FORMAT_B8G8R8A8_UNORM) { chosen = f; break; }
+            if (f.format == VK_FORMAT_R8G8B8A8_UNORM)
+            {
+                chosen = f;
+                foundNative = true;
+                break;
+            }
+        if (!foundNative)
+#endif
+            for (const auto& f : formats)
+                if (f.format == VK_FORMAT_B8G8R8A8_UNORM) { chosen = f; break; }
         g.swapchainFormat = chosen.format;
 
         VkSwapchainCreateInfoKHR info{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
