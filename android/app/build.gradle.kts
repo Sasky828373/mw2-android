@@ -71,9 +71,11 @@ android {
                     // The runtime's optional parts, all off: they cost frames
                     // and the phone has none to spare.
                     "-DMW2_DIAGNOSTICS=OFF",
+                    "-DMW2_TRACE_INDIRECT=OFF",
                     "-DMW2_USE_SDL=OFF",
                     "-DMW2_LOGGING=ON",
                     "-DCMAKE_BUILD_TYPE=Release",
+                    "-DMW2_ANDROID_LINK_GC=ON",
                 )
                 setting("MW2_COMPILER_LAUNCHER")?.let {
                     arguments += listOf(
