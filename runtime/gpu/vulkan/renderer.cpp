@@ -352,6 +352,16 @@ bool vk::renderer::Initialise()
     dispatch.setStencilTestEnable = PFN_vkCmdSetStencilTestEnableEXT(command("vkCmdSetStencilTestEnableEXT", "vkCmdSetStencilTestEnable"));
     dispatch.setStencilOp = PFN_vkCmdSetStencilOpEXT(command("vkCmdSetStencilOpEXT", "vkCmdSetStencilOp"));
     dispatch.drawMulti = PFN_vkCmdDrawMultiEXT(command("vkCmdDrawMultiEXT"));
+    dispatch.drawMultiIndexed = PFN_vkCmdDrawMultiIndexedEXT(command("vkCmdDrawMultiIndexedEXT"));
+    if (dispatch.drawMulti || dispatch.drawMultiIndexed)
+    {
+        VkPhysicalDeviceMultiDrawPropertiesEXT limits{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT };
+        VkPhysicalDeviceProperties2 props{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        props.pNext = &limits;
+        vkGetPhysicalDeviceProperties2(g.physical, &props);
+        dispatch.maxMultiDrawCount = limits.maxMultiDrawCount;
+    }
     if (!dispatch.beginRendering || !dispatch.endRendering || !dispatch.setCullMode ||
         !dispatch.setStencilOp)
     {
