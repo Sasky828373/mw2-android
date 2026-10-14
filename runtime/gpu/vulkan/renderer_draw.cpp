@@ -7,6 +7,7 @@
 #include "../../guest.h"
 #include "../../kernel/physical.h"
 #include "../../log.h"
+#include "../../env.h"
 #include "../internal.h"
 
 #include <algorithm>
@@ -528,9 +529,21 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
                       uint32_t(colourTarget->format), uint32_t(depthTarget->format),
                       key.topology, depthControl, key.blendControl,
                       key.colourMask, modeCntl, key.samples };
-        EnqueuePipelineWarmup(rec, /*highPriority=*/true);
-        Skip("pipeline compiling asynchronously in background");
-        return;
+        // Correctness mode for first encounters: prevent permanently missing
+        // geometry when a warmup has not completed. This can stall one frame;
+        // keep the asynchronous path by default for smoother frame timing.
+        if (env::Flag("MW2_SYNC_PIPELINE_MISS"))
+        {
+            Stopwatch watch(g.pipelineNanoseconds);
+            built = EnsurePipeline(key, *vertex, *pixel, &newPipeline);
+            if (!built) { Skip("pipeline rejected after synchronous compile"); return; }
+        }
+        else
+        {
+            EnqueuePipelineWarmup(rec, /*highPriority=*/true);
+            Skip("pipeline compiling asynchronously in background");
+            return;
+        }
     }
 #else
     VkPipeline built = [&] { Stopwatch watch(g.pipelineNanoseconds);
