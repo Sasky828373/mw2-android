@@ -96,14 +96,24 @@ namespace
                 q.recorderAsleep.store(false, std::memory_order_relaxed);
                 continue;
             }
+            // Publish completion in batches instead of paying for a seq_cst
+            // atomic store on every Vulkan command. Keep waiter latency low:
+            // a waiting producer/fence can still observe progress promptly.
+            uint32_t completedInBatch = 0;
             while (at != end)
             {
                 Header* header = reinterpret_cast<Header*>(ring + (at & (kBytes - 1)));
                 if (header->run) header->run(header + 1, header->command);
                 at += header->bytes;
                 calls++;
-                q.made.store(at, std::memory_order_seq_cst);
-                if (q.waiters.load(std::memory_order_seq_cst)) q.made.notify_all();
+                ++completedInBatch;
+                const bool waiting = q.waiters.load(std::memory_order_acquire) != 0;
+                if (waiting || completedInBatch >= 32 || at == end)
+                {
+                    q.made.store(at, std::memory_order_release);
+                    if (waiting) q.made.notify_all();
+                    completedInBatch = 0;
+                }
             }
         }
         q.calls.store(calls, std::memory_order_relaxed);
