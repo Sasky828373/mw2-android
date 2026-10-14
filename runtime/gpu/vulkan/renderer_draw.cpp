@@ -11,6 +11,7 @@
 #include "../internal.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -240,6 +241,7 @@ namespace vk::renderer::detail
 
     // Only the ring-consumer thread appends here. The recorder receives an
     // owning copy of each batch, so no pending draw points at guest memory.
+    constexpr size_t kBufferedDraws = 64;
     thread_local std::vector<DrawOp> pendingDraws;
     void FlushDrawBatch()
     {
@@ -262,7 +264,7 @@ namespace vk::renderer::detail
                                                : dispatch.drawMulti != nullptr;
                 // Vulkan requires drawCount < maxMultiDrawCount for this EXT.
                 const size_t capacity = dispatch.maxMultiDrawCount > 2
-                    ? size_t(dispatch.maxMultiDrawCount - 1) : 0;
+                    ? std::min(kBufferedDraws, size_t(dispatch.maxMultiDrawCount - 1)) : 0;
                 if ((indexed || plain) && supported && batch[i].count && capacity >= 2)
                 {
                     size_t end = i + 1;
@@ -273,21 +275,21 @@ namespace vk::renderer::detail
                     {
                         if (indexed)
                         {
-                            std::vector<VkMultiDrawIndexedInfoEXT> infos;
-                            infos.reserve(end - i);
+                            // The producer bounds each batch at 64 draws:
+                            // avoid heap allocations on the recorder thread.
+                            std::array<VkMultiDrawIndexedInfoEXT, kBufferedDraws> infos{};
                             for (size_t j = i; j < end; ++j)
-                                infos.push_back({ batch[j].firstIndex, batch[j].count, 0 });
-                            dispatch.drawMultiIndexed(command, uint32_t(infos.size()), infos.data(),
+                                infos[j - i] = { batch[j].firstIndex, batch[j].count, 0 };
+                            dispatch.drawMultiIndexed(command, uint32_t(end - i), infos.data(),
                                                        1, 0, sizeof(VkMultiDrawIndexedInfoEXT),
                                                        nullptr);
                         }
                         else
                         {
-                            std::vector<VkMultiDrawInfoEXT> infos;
-                            infos.reserve(end - i);
+                            std::array<VkMultiDrawInfoEXT, kBufferedDraws> infos{};
                             for (size_t j = i; j < end; ++j)
-                                infos.push_back({ 0, batch[j].count });
-                            dispatch.drawMulti(command, uint32_t(infos.size()), infos.data(),
+                                infos[j - i] = { 0, batch[j].count };
+                            dispatch.drawMulti(command, uint32_t(end - i), infos.data(),
                                                1, 0, sizeof(VkMultiDrawInfoEXT));
                         }
                         i = end;
@@ -304,7 +306,7 @@ namespace vk::renderer::detail
         pendingDraws.push_back(op);
         // A bounded batch avoids accumulating memory during a long sequence
         // of draws with no intervening transfers or render-pass boundaries.
-        if (pendingDraws.size() >= 64) FlushDrawBatch();
+        if (pendingDraws.size() >= kBufferedDraws) FlushDrawBatch();
     }
 }
 
