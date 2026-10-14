@@ -562,7 +562,11 @@ namespace vk::renderer::detail
                          tookMs, c, g_statQueued.load(std::memory_order_relaxed));
 
                     static uint32_t s_lastSave = 0;
-                    if (c - s_lastSave >= 5)
+                    // Pipeline-cache serialization can contend with the
+                    // gameplay compiler and perform synchronous disk writes.
+                    // Batch updates and leave persistence to idle moments
+                    // (shutdown also saves the cache).
+                    if (c - s_lastSave >= 32 && !RenderActive())
                     {
                         s_lastSave = c;
                         vk::pipeline::SaveCache();

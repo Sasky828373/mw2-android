@@ -62,6 +62,7 @@ void vk::textures::BeginUploads(uint32_t) {}
 #include <cstring>
 #include <map>
 #include <deque>
+#include <functional>
 #include <string>
 #include <unordered_map>
 
@@ -1391,14 +1392,20 @@ namespace
         for (size_t i = 0; i < g.images.size(); i++)
             if (Idle(g.images[i])) oldest.push_back({ g.images[i].lastBound, uint64_t(i + 1) });
         if (oldest.empty()) return;
-        std::sort(oldest.begin(), oldest.end());
+        // Sorting every idle texture costs O(n log n) during budget pressure
+        // and produces a visible CPU spike when the cache has thousands of
+        // entries. A min-heap builds in O(n), then evicts the least-recently
+        // used image in O(log n) until the budget is recovered.
+        std::make_heap(oldest.begin(), oldest.end(), std::greater<>{});
         const uint64_t target = g.budget / 4 * 3;
         uint64_t count = 0, bytes = 0;
-        for (const auto& [lastBound, id] : oldest)
+        while (g.liveBytes > target && !oldest.empty())
         {
-            if (g.liveBytes <= target) break;
+            std::pop_heap(oldest.begin(), oldest.end(), std::greater<>{});
+            const uint64_t id = oldest.back().second;
+            oldest.pop_back();
             bytes += g.images[size_t(id - 1)].bytes;
-            count++;
+            ++count;
             Release(id);
         }
         g.evicted += count;

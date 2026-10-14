@@ -391,10 +391,30 @@ void vk::renderer::Swap(uint32_t frontBuffer)
     blit.dstSubresource = blit.srcSubresource;
     blit.dstOffsets[1] = { int32_t(g.presentWidth), int32_t(g.presentHeight), 1 };
     const VkImage frameImage = frame.image;
-    Record([=](VkCommandBuffer command) {
-        vkCmdBlitImage(command, frameImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       present, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
-    });
+    // A native-resolution RGBA resolve needs neither filtering nor colour
+    // conversion. Prefer a transfer copy to a filtering blit on this hot path.
+    // Retain the exact original blit for different formats or dimensions.
+    const bool nativeCopy = frame.format == VK_FORMAT_R8G8B8A8_UNORM &&
+                            uint64_t(frame.width) * g.scale == g.presentWidth &&
+                            uint64_t(frame.height) * g.scale == g.presentHeight;
+    if (nativeCopy)
+    {
+        VkImageCopy copy{};
+        copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        copy.dstSubresource = copy.srcSubresource;
+        copy.extent = { g.presentWidth, g.presentHeight, 1 };
+        Record([=](VkCommandBuffer command) {
+            vkCmdCopyImage(command, frameImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           present, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        });
+    }
+    else
+    {
+        Record([=](VkCommandBuffer command) {
+            vkCmdBlitImage(command, frameImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           present, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        });
+    }
     RecordBarrier(frame.image, VK_IMAGE_ASPECT_COLOR_BIT,
                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                   VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,

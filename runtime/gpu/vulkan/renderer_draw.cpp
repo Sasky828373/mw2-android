@@ -344,13 +344,6 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
     ScissorOf(r, scissor);
     if (!scissor.extent.width || !scissor.extent.height) { Skip("empty scissor"); return; }
 
-    gpu::detail::SetCurrentDrawStage("Draw_ShaderFor");
-    const Shader* vertex = ShaderFor(shader::Type::Vertex, call.vertexHash,
-                                     call.vertexCode, call.vertexWords);
-    const Shader* pixel = ShaderFor(shader::Type::Pixel, call.pixelHash,
-                                    call.pixelCode, call.pixelWords);
-    if (!vertex || !pixel) { Skip("shader not translated"); return; }
-
     const gpu::SurfaceInfo surface{ r[gpu::RB_SURFACE_INFO] };
     const gpu::ColorInfo colour{ r[gpu::RB_COLOR_INFO] };
     const gpu::DepthInfo depthInfo{ r[gpu::RB_DEPTH_INFO] };
@@ -376,6 +369,30 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
         Skip("EDRAM depth clear");
         return;
     }
+
+    // Purely clipped/empty geometry cannot write to the 2048x2048 EDRAM
+    // target. Check it before allocating images, reading indices or compiling
+    // shaders; preserve the special depth-clear packet handled above.
+    const int64_t right = int64_t(scissor.offset.x) + scissor.extent.width;
+    const int64_t bottom = int64_t(scissor.offset.y) + scissor.extent.height;
+    if (scissor.offset.x >= 2048 || scissor.offset.y >= 2048 ||
+        right <= 0 || bottom <= 0)
+    {
+        Skip("fully clipped from EDRAM");
+        return;
+    }
+    if (!call.indexCount || (call.indexed && !call.indexAddress))
+    {
+        Skip("no geometry");
+        return;
+    }
+
+    gpu::detail::SetCurrentDrawStage("Draw_ShaderFor");
+    const Shader* vertex = ShaderFor(shader::Type::Vertex, call.vertexHash,
+                                     call.vertexCode, call.vertexWords);
+    const Shader* pixel = ShaderFor(shader::Type::Pixel, call.pixelHash,
+                                    call.pixelCode, call.pixelWords);
+    if (!vertex || !pixel) { Skip("shader not translated"); return; }
 
     // The colour-and-depth form comes in pairs that describe one row of EDRAM
     // two ways: the bulk of it as a surface half as wide with twice the sample
@@ -638,7 +655,7 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
                                key.topology, depthControl, key.blendControl,
                                key.colourMask, modeCntl, key.samples });
         static uint32_t s_lastSaved = 0;
-        if (g.recorded.size() - s_lastSaved >= 5)
+        if (g.recorded.size() - s_lastSaved >= 32)
         {
             s_lastSaved = uint32_t(g.recorded.size());
             WriteShaderCache();
