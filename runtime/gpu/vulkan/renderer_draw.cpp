@@ -257,16 +257,18 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
     const VkPrimitiveTopology topology = TopologyFor(call.primitive);
     if (topology == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM) { Skip("primitive type"); return; }
 
+    // Reject zero-area draws before translating shaders or creating pipelines.
+    // They cannot touch a target, regardless of their shader state.
+    VkRect2D scissor{};
+    ScissorOf(r, scissor);
+    if (!scissor.extent.width || !scissor.extent.height) { Skip("empty scissor"); return; }
+
     gpu::detail::SetCurrentDrawStage("Draw_ShaderFor");
     const Shader* vertex = ShaderFor(shader::Type::Vertex, call.vertexHash,
                                      call.vertexCode, call.vertexWords);
     const Shader* pixel = ShaderFor(shader::Type::Pixel, call.pixelHash,
                                     call.pixelCode, call.pixelWords);
     if (!vertex || !pixel) { Skip("shader not translated"); return; }
-
-    VkRect2D scissor{};
-    ScissorOf(r, scissor);
-    if (!scissor.extent.width || !scissor.extent.height) { Skip("empty scissor"); return; }
 
     const gpu::SurfaceInfo surface{ r[gpu::RB_SURFACE_INFO] };
     const gpu::ColorInfo colour{ r[gpu::RB_COLOR_INFO] };
