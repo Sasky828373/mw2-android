@@ -27,9 +27,22 @@ namespace vk::renderer::detail
         const bool wasRecording = g.recording;
         if (wasRecording) Submit(true);
         vk::record::Drain();
-        // The queue is in order, so nothing is outstanding afterwards.
-        vkDeviceWaitIdle(g.device);
-        for (State::Slot& slot : g.slots) slot.inFlight = false;
+        // Retire the renderer's known submissions using their per-slot fences.
+        // Avoid a device-wide stall in the normal destruction path; presenter
+        // work on the shared queue is independent of these resources.
+        bool retired = true;
+        for (State::Slot& slot : g.slots)
+            if (slot.inFlight && !WaitForSlot(slot, "a resource retirement fence"))
+                retired = false;
+        if (!retired)
+        {
+            // A failed/timed-out fence must not let us destroy live resources.
+            // Only this exceptional recovery path waits for the whole device.
+            if (vk::pipeline::Failed(vkDeviceWaitIdle(g.device),
+                                     "device idle after a retirement fence failure"))
+                return;
+            for (State::Slot& slot : g.slots) slot.inFlight = false;
+        }
         if (wasRecording) BeginFrame();
     }
 
