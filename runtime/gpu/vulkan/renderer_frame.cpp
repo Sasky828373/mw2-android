@@ -249,8 +249,9 @@ namespace vk::renderer::detail
         }
         if (res == VK_TIMEOUT)
         {
-            LOGE("renderer: fence wait timed out for %s; aborting wait to avoid permanent hang", what);
-            slot.inFlight = false;
+            LOGE("renderer: fence wait timed out for %s; keeping slot in-flight to avoid reusing live GPU resources", what);
+            // A timed-out fence has NOT signalled. Never mark this slot free:
+            // its command pool and arena allocations can still be used by GPU.
             return false;
         }
         if (vk::pipeline::Failed(res, what))
