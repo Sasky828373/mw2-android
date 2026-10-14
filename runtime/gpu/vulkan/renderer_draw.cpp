@@ -529,10 +529,11 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
                       uint32_t(colourTarget->format), uint32_t(depthTarget->format),
                       key.topology, depthControl, key.blendControl,
                       key.colourMask, modeCntl, key.samples };
-        // Correctness mode for first encounters: prevent permanently missing
-        // geometry when a warmup has not completed. This can stall one frame;
-        // keep the asynchronous path by default for smoother frame timing.
-        if (env::Flag("MW2_SYNC_PIPELINE_MISS"))
+        // Correctness first: a missing pipeline must never silently discard
+        // geometry. The first use may stall, but the warmup worker and
+        // persistent cache reduce the number of such misses. An explicit
+        // diagnostic opt-out restores the old skip-on-miss behavior.
+        if (!env::Flag("MW2_ASYNC_PIPELINE_MISS"))
         {
             Stopwatch watch(g.pipelineNanoseconds);
             built = EnsurePipeline(key, *vertex, *pixel, &newPipeline);
