@@ -16,13 +16,13 @@ on:
       upload_release:
         description: "Upload APK directly to GitHub Release"
         type: boolean
-        default: true
+        default: false
       release_tag:
         description: "GitHub Release tag to attach to"
         type: string
         default: "v0.0.1"
   push:
-    branches: [ master ]
+    branches: [ master, 'optimize/campaign-vulkan-120fps-20261014' ]
     paths:
       - 'android/**'
       - 'runtime/**'
