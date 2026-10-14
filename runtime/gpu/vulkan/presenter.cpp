@@ -821,8 +821,12 @@ namespace
         if (g.remakeSwapchain || !g.swapchain) { LetGo(); return; }
 
         Frame& frame = g.frames[g.frameIndex];
-        if (vk::pipeline::Failed(vkWaitForFences(g.device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX),
-                                 "the presenter's fence"))
+        // Reusing a completed frame slot must not enter a blocking driver wait.
+        // This still waits for outstanding submissions before resetting the slot.
+        VkResult ready = vkGetFenceStatus(g.device, frame.inFlight);
+        if (ready == VK_NOT_READY)
+            ready = vkWaitForFences(g.device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX);
+        if (vk::pipeline::Failed(ready, "the presenter's fence"))
             return;
 
         // FIFO: this is where the window waits for the display, with the
