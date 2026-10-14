@@ -239,8 +239,16 @@ namespace vk::renderer::detail
         if (!wait) return true;
 
         if (!WaitForSlot(slot, "a frame slot's fence")) return false;
-        // One queue, submitted in order: this one being done says all of them are.
-        for (State::Slot& other : g.slots) other.inFlight = false;
+        // Do not clear another slot merely because the queue is ordered:
+        // recorder submissions can still be pending, and each slot owns a
+        // separate command pool and arena region. Retire only confirmed work.
+        for (State::Slot& other : g.slots)
+        {
+            if (&other == &slot || !other.inFlight) continue;
+            if (vk::record::Done(other.queuedAt) &&
+                vkGetFenceStatus(g.device, other.fence) == VK_SUCCESS)
+                other.inFlight = false;
+        }
         return true;
     }
 
