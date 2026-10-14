@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_set>
 #ifdef MW2_ANDROID
@@ -432,6 +433,7 @@ namespace vk::renderer::detail
         std::mutex g_warmupMutex;
         std::condition_variable g_warmupCv;
         std::deque<QueueItem> g_warmupQueue;
+        std::optional<Recorded> g_inFlight;
         std::thread g_warmupThread;
         std::atomic<bool> g_warmupRunning{ false };
         std::atomic<bool> g_warmupStopping{ false };
@@ -492,7 +494,17 @@ namespace vk::renderer::detail
 
                     item = g_warmupQueue.front();
                     g_warmupQueue.pop_front();
+                    g_inFlight = item.recorded;
                 }
+
+                struct ReleaseInFlight
+                {
+                    ~ReleaseInFlight()
+                    {
+                        std::lock_guard lock(g_warmupMutex);
+                        g_inFlight.reset();
+                    }
+                } releaseInFlight;
 
                 PipelineKey key;
                 key.vertexShader = item.recorded.vertexShader;
@@ -618,6 +630,18 @@ namespace vk::renderer::detail
     {
         {
             std::lock_guard lock(warmup::g_warmupMutex);
+            // A currently compiling item is no longer in the deque.
+            // Avoid duplicate submissions while the worker is processing it.
+            if (warmup::g_inFlight)
+            {
+                const Recorded& in = *warmup::g_inFlight;
+                if (in.vertexShader == rec.vertexShader && in.pixelShader == rec.pixelShader &&
+                    in.colourFormat == rec.colourFormat && in.depthFormat == rec.depthFormat &&
+                    in.topology == rec.topology && in.blendControl == rec.blendControl &&
+                    in.colourMask == rec.colourMask && in.modeCntl == rec.modeCntl &&
+                    in.depthControl == rec.depthControl && in.samples == rec.samples)
+                    return;
+            }
             for (auto it = warmup::g_warmupQueue.begin(); it != warmup::g_warmupQueue.end(); ++it)
             {
                 const auto& item = *it;
