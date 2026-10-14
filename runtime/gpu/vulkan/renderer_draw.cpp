@@ -14,6 +14,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 #ifdef MW2_HAVE_VULKAN
 
@@ -236,6 +237,52 @@ namespace vk::renderer::detail
             }
         }
     };
+
+    // Only the ring-consumer thread appends here. The recorder receives an
+    // owning copy of each batch, so no pending draw points at guest memory.
+    thread_local std::vector<DrawOp> pendingDraws;
+    void FlushDrawBatch()
+    {
+        if (pendingDraws.empty()) return;
+        auto batch = std::move(pendingDraws);
+        pendingDraws.clear();
+        // Deliberately bypass Record(): it calls FlushDrawBatch itself.
+        vk::record::Command([batch = std::move(batch)](VkCommandBuffer command) {
+            for (size_t i = 0; i < batch.size();)
+            {
+                // No state change, non-indexed geometry, one instance, and
+                // identical firstVertex: safe consecutive multi-draw candidates.
+                // Do not merge indexed draws, push constants or descriptor
+                // changes; their precise order/state is significant.
+                if (dispatch.drawMulti && batch[i].set == 0 && batch[i].count)
+                {
+                    size_t end = i + 1;
+                    while (end < batch.size() && batch[end].set == 0 && batch[end].count)
+                        ++end;
+                    if (end - i >= 2)
+                    {
+                        std::vector<VkMultiDrawInfoEXT> infos;
+                        infos.reserve(end - i);
+                        for (size_t j = i; j < end; ++j)
+                            infos.push_back({ 0, batch[j].count });
+                        dispatch.drawMulti(command, uint32_t(infos.size()), infos.data(),
+                                           1, 0, sizeof(VkMultiDrawInfoEXT));
+                        i = end;
+                        continue;
+                    }
+                }
+                batch[i++](command);
+            }
+        });
+    }
+
+    void QueueDraw(const DrawOp& op)
+    {
+        pendingDraws.push_back(op);
+        // A bounded batch avoids accumulating memory during a long sequence
+        // of draws with no intervening transfers or render-pass boundaries.
+        if (pendingDraws.size() >= 64) FlushDrawBatch();
+    }
 }
 
 using namespace vk::renderer::detail;
@@ -878,7 +925,7 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
     }
     else op.count = call.indexCount;
     gpu::detail::SetCurrentDrawStage("Draw_Record");
-    Record(op);
+    QueueDraw(op);
     colourTarget->draws++;
     // The depth target too, so a dump can tell a depth buffer some pass is
     // testing against from one no pass has ever bound.
