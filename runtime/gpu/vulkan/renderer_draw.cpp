@@ -244,8 +244,11 @@ namespace vk::renderer::detail
     void FlushDrawBatch()
     {
         if (pendingDraws.empty()) return;
-        auto batch = std::move(pendingDraws);
-        pendingDraws.clear();
+        // Reuse the producer's capacity instead of allocating a new vector
+        // for each draw group (typically thousands of groups per frame).
+        std::vector<DrawOp> batch;
+        batch.swap(pendingDraws);
+        if (pendingDraws.capacity() < 64) pendingDraws.reserve(64);
         // Deliberately bypass Record(): it calls FlushDrawBatch itself.
         vk::record::Command([batch = std::move(batch)](VkCommandBuffer command) {
             for (size_t i = 0; i < batch.size();)
