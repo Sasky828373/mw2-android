@@ -248,6 +248,13 @@ namespace
         // in: one nothing has bound for kUnusedFrames goes back to its pool.
         struct Set { VkDescriptorSet set; uint32_t pool; uint64_t lastUsed; };
         std::unordered_map<std::array<uint64_t, vk::textures::kSlots>, Set, WordsHash> sets;
+        // Consecutive draws normally reuse exactly the same 32 texture slots.
+        // Cache the last lookup's node, not just the handle, so its last-used
+        // frame can still be refreshed without hashing 32 uint64_t keys.
+        // Unordered-map node addresses survive rehash; every erase/clear below
+        // explicitly invalidates this pointer.
+        std::array<uint64_t, vk::textures::kSlots> hotSetKey{};
+        Set* hotSet = nullptr;
         // Sets dropped from the cache all at once, which commands not yet run
         // may still bind: freed when they are that old too.
         std::vector<Set> retiredSets;
@@ -1035,6 +1042,7 @@ void vk::textures::Shutdown()
     g.freeIds.clear();
     g.byFetch.clear();
     g.byContent.clear();
+    g.hotSet = nullptr;
     g.sets.clear();
     g.retiredSets.clear();
     g.samplerList.clear();
@@ -1288,6 +1296,7 @@ namespace
     // not yet run may still bind them, so they are freed with the unused.
     void RetireSets()
     {
+        g.hotSet = nullptr;
         for (const auto& [key, entry] : g.sets)
             g.retiredSets.push_back({ entry.set, entry.pool, g.frame });
         g.sets.clear();
@@ -1295,6 +1304,8 @@ namespace
 
     void SweepSets()
     {
+        // This pass may erase a node that the hot descriptor points to.
+        g.hotSet = nullptr;
         for (auto entry = g.sets.begin(); entry != g.sets.end();)
         {
             if (g.frame - entry->second.lastUsed < kUnusedFrames) { ++entry; continue; }
@@ -1797,10 +1808,17 @@ void* vk::textures::DescriptorSet(const uint64_t ids[kSlots], const uint8_t* kin
     std::array<uint64_t, kSlots> key{};
     for (uint32_t i = 0; i < kSlots; i++)
         key[i] = ids[i] | (uint64_t(kinds ? kinds[i] : 0) << 62);
+    if (g.hotSet && g.hotSetKey == key)
+    {
+        g.hotSet->lastUsed = g.frame;
+        return g.hotSet->set;
+    }
     auto found = g.sets.find(key);
     if (found != g.sets.end())
     {
         found->second.lastUsed = g.frame;
+        g.hotSetKey = key;
+        g.hotSet = &found->second;
         return found->second.set;
     }
 
@@ -1858,7 +1876,10 @@ void* vk::textures::DescriptorSet(const uint64_t ids[kSlots], const uint8_t* kin
         writes[i].pImageInfo = &images[i];
     }
     vkUpdateDescriptorSets(g.device, kSlots, writes, 0, nullptr);
-    g.sets[key] = { set, g.allocPool, g.frame };
+    auto [created, inserted] = g.sets.emplace(key, State::Set{ set, g.allocPool, g.frame });
+    // One consumer owns descriptor-cache writes, so this is always a new key.
+    g.hotSetKey = key;
+    g.hotSet = &created->second;
     g.descriptorSets++;
     return set;
 }
