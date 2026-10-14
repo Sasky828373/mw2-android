@@ -536,6 +536,8 @@ namespace vk::renderer::detail
         PFN_vkCmdSetStencilTestEnableEXT setStencilTestEnable = nullptr;
         PFN_vkCmdSetStencilOpEXT setStencilOp = nullptr;
         PFN_vkCmdDrawMultiEXT drawMulti = nullptr;
+        PFN_vkCmdDrawMultiIndexedEXT drawMultiIndexed = nullptr;
+        uint32_t maxMultiDrawCount = 0;
     };
     inline Dispatch dispatch;
 
