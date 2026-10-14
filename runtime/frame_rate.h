@@ -41,8 +41,12 @@ namespace frame_rate
             next = now + period;
             return;
         }
-        if (now < next) std::this_thread::sleep_until(next);
-        next += period;
+        if (now < next)
+            std::this_thread::sleep_until(next);
+        const auto after = Clock::now();
+        // Never create a burst of catch-up frames after the OS wakes us late.
+        // Restart the cadence when a deadline has already passed.
+        next = (after > next) ? after + period : next + period;
     }
 
     // Frames are retired at the blank, one a blank, as on the console.
