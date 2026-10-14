@@ -206,11 +206,21 @@ namespace vk::renderer::detail
                     vkCmdSetStencilReference(command, faces[i], state.Reference());
                 }
             }
-            if (set & kConstants)
+            // Adjacent descriptor sets 0 and 1 can be bound together when
+            // both change, avoiding one Vulkan dispatch per such draw.
+            if ((set & (kConstants | kTextures)) == (kConstants | kTextures))
+            {
+                static_assert(bindings::kTextureSet == bindings::kConstantSet + 1);
+                const VkDescriptorSet sets[] = { constantSet, textureSet };
+                vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+                                        bindings::kConstantSet, 2, sets,
+                                        bindings::kConstantBlocks, dynamic);
+            }
+            else if (set & kConstants)
                 vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
                                         bindings::kConstantSet, 1, &constantSet,
                                         bindings::kConstantBlocks, dynamic);
-            if (set & kTextures)
+            else if (set & kTextures)
                 vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
                                         bindings::kTextureSet, 1, &textureSet, 0, nullptr);
             if (set & kAlphaTest)
