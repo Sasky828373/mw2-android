@@ -43,8 +43,13 @@ namespace
 
     // A frame queues about 2 MB; this is several frames.
     constexpr uint64_t kBytes = 16u << 20;
-    // Pauses before a side sleeps: tens of microseconds.
+    // Android ARM64: a shorter spin window avoids burning a fast CPU core
+    // while the GPU/producer is idle. Atomic wait/notify provides wakeups.
+#if defined(__ANDROID__)
+    constexpr uint32_t kSpins = 256;
+#else
     constexpr uint32_t kSpins = 4000;
+#endif
 
     // Each side's own fields on lines of their own, so neither side's writes
     // take the other's cache line away from it on every call.
