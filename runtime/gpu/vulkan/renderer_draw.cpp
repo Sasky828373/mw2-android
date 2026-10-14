@@ -216,8 +216,13 @@ namespace vk::renderer::detail
                 vkCmdPushConstants(command, layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                                    bindings::kPixelPushOffset, sizeof push, push);
             if (set & kIndexBuffer) vkCmdBindIndexBuffer(command, indexBuffer, 0, indexType);
-            if (set & kIndexed) vkCmdDrawIndexed(command, count, 1, firstIndex, 0, 0);
-            else vkCmdDraw(command, count, 1, 0, 0);
+            // Zero-vertex draws contribute no geometry. Keep the state
+            // commands above intact, but avoid an empty GPU draw command.
+            if (count != 0)
+            {
+                if (set & kIndexed) vkCmdDrawIndexed(command, count, 1, firstIndex, 0, 0);
+                else vkCmdDraw(command, count, 1, 0, 0);
+            }
         }
     };
 }
