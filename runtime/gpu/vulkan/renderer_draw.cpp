@@ -250,23 +250,43 @@ namespace vk::renderer::detail
         vk::record::Command([batch = std::move(batch)](VkCommandBuffer command) {
             for (size_t i = 0; i < batch.size();)
             {
-                // No state change, non-indexed geometry, one instance, and
-                // identical firstVertex: safe consecutive multi-draw candidates.
-                // Do not merge indexed draws, push constants or descriptor
-                // changes; their precise order/state is significant.
-                if (dispatch.drawMulti && batch[i].set == 0 && batch[i].count)
+                // Only draw operations with no intervening state changes
+                // can be combined. An indexed draw carries the kIndexed bit,
+                // even if the bound index buffer itself did not change.
+                const bool indexed = batch[i].set == DrawOp::kIndexed;
+                const bool plain = batch[i].set == 0;
+                const bool supported = indexed ? dispatch.drawMultiIndexed != nullptr
+                                               : dispatch.drawMulti != nullptr;
+                // Vulkan requires drawCount < maxMultiDrawCount for this EXT.
+                const size_t capacity = dispatch.maxMultiDrawCount > 2
+                    ? size_t(dispatch.maxMultiDrawCount - 1) : 0;
+                if ((indexed || plain) && supported && batch[i].count && capacity >= 2)
                 {
                     size_t end = i + 1;
-                    while (end < batch.size() && batch[end].set == 0 && batch[end].count)
+                    while (end < batch.size() && end - i < capacity &&
+                           batch[end].set == batch[i].set && batch[end].count)
                         ++end;
                     if (end - i >= 2)
                     {
-                        std::vector<VkMultiDrawInfoEXT> infos;
-                        infos.reserve(end - i);
-                        for (size_t j = i; j < end; ++j)
-                            infos.push_back({ 0, batch[j].count });
-                        dispatch.drawMulti(command, uint32_t(infos.size()), infos.data(),
-                                           1, 0, sizeof(VkMultiDrawInfoEXT));
+                        if (indexed)
+                        {
+                            std::vector<VkMultiDrawIndexedInfoEXT> infos;
+                            infos.reserve(end - i);
+                            for (size_t j = i; j < end; ++j)
+                                infos.push_back({ batch[j].firstIndex, batch[j].count, 0 });
+                            dispatch.drawMultiIndexed(command, uint32_t(infos.size()), infos.data(),
+                                                       1, 0, sizeof(VkMultiDrawIndexedInfoEXT),
+                                                       nullptr);
+                        }
+                        else
+                        {
+                            std::vector<VkMultiDrawInfoEXT> infos;
+                            infos.reserve(end - i);
+                            for (size_t j = i; j < end; ++j)
+                                infos.push_back({ 0, batch[j].count });
+                            dispatch.drawMulti(command, uint32_t(infos.size()), infos.data(),
+                                               1, 0, sizeof(VkMultiDrawInfoEXT));
+                        }
                         i = end;
                         continue;
                     }
