@@ -564,20 +564,7 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
         }
     }
 
-    // What each slot is declared as, so a texture of another kind is not bound
-    // there. The two stages share the set; where both sample a slot the pixel
-    // shader's reading wins, and the title has not been seen to disagree.
-    uint8_t kinds[vk::textures::kSlots];
-    for (uint32_t s = 0; s < vk::textures::kSlots; s++)
-        kinds[s] = (pixel->translation.textureMask & (1u << s))
-                       ? pixel->translation.textureKinds[s]
-                       : vertex->translation.textureKinds[s];
-    uint32_t scaledSlots = 0;
-    gpu::detail::SetCurrentDrawStage("Draw_TextureSetFor");
-    VkDescriptorSet textureSet = TextureSetFor(
-        r, vertex->translation.textureMask | pixel->translation.textureMask, kinds, scaledSlots);
-    if (!textureSet) { Skip("no texture descriptor set"); return; }
-
+    // Cull fully clipped draws before texture uploads and descriptor allocation.
     VkViewport viewport{};
     ViewportOf(r, scissor, viewport);
 
@@ -601,6 +588,21 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
     scissor.extent.height = std::min(scissor.extent.height,
                                      g.currentHeight - uint32_t(scissor.offset.y));
     if (!scissor.extent.width || !scissor.extent.height) { Skip("empty scissor"); return; }
+
+
+    // What each slot is declared as, so a texture of another kind is not bound
+    // there. The two stages share the set; where both sample a slot the pixel
+    // shader's reading wins, and the title has not been seen to disagree.
+    uint8_t kinds[vk::textures::kSlots];
+    for (uint32_t s = 0; s < vk::textures::kSlots; s++)
+        kinds[s] = (pixel->translation.textureMask & (1u << s))
+                       ? pixel->translation.textureKinds[s]
+                       : vertex->translation.textureKinds[s];
+    uint32_t scaledSlots = 0;
+    gpu::detail::SetCurrentDrawStage("Draw_TextureSetFor");
+    VkDescriptorSet textureSet = TextureSetFor(
+        r, vertex->translation.textureMask | pixel->translation.textureMask, kinds, scaledSlots);
+    if (!textureSet) { Skip("no texture descriptor set"); return; }
 
     State::Bound& bound = g.bound;
     DrawOp op;
