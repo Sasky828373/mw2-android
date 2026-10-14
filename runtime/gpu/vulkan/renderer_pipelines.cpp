@@ -417,6 +417,7 @@ namespace vk::renderer::detail
         struct QueueItem
         {
             Recorded recorded;
+            bool highPriority = false;
         };
 
         std::mutex g_warmupMutex;
@@ -578,7 +579,15 @@ namespace vk::renderer::detail
                 {
                     sleepMs = 35;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+                // Low-priority warmup must yield to gameplay pipeline misses.
+                // Wake promptly for newly queued urgent work or shutdown.
+                {
+                    std::unique_lock lock(g_warmupMutex);
+                    g_warmupCv.wait_for(lock, std::chrono::milliseconds(sleepMs), [&] {
+                        return g_warmupStopping.load(std::memory_order_relaxed) ||
+                               (!g_warmupQueue.empty() && g_warmupQueue.front().highPriority);
+                    });
+                }
                 if (sleepMs >= 200)
                     LOGI("warmup: render-active backpressure -- slept %d ms after %u ms compile",
                          sleepMs, tookMs);
@@ -600,8 +609,9 @@ namespace vk::renderer::detail
     {
         {
             std::lock_guard lock(warmup::g_warmupMutex);
-            for (const auto& item : warmup::g_warmupQueue)
+            for (auto it = warmup::g_warmupQueue.begin(); it != warmup::g_warmupQueue.end(); ++it)
             {
+                const auto& item = *it;
                 if (item.recorded.vertexShader == rec.vertexShader &&
                     item.recorded.pixelShader == rec.pixelShader &&
                     item.recorded.colourFormat == rec.colourFormat &&
@@ -610,15 +620,26 @@ namespace vk::renderer::detail
                     item.recorded.blendControl == rec.blendControl &&
                     item.recorded.colourMask == rec.colourMask &&
                     item.recorded.modeCntl == rec.modeCntl &&
-                    item.recorded.depthControl == rec.depthControl)
+                    item.recorded.depthControl == rec.depthControl &&
+                    item.recorded.samples == rec.samples)
                 {
+                    // A cache prewarm that becomes visible during gameplay
+                    // should not sit behind hundreds of background pipelines.
+                    if (highPriority && !it->highPriority)
+                    {
+                        auto promoted = *it;
+                        promoted.highPriority = true;
+                        warmup::g_warmupQueue.erase(it);
+                        warmup::g_warmupQueue.push_front(promoted);
+                        warmup::g_warmupCv.notify_one();
+                    }
                     return;
                 }
             }
             if (highPriority)
-                warmup::g_warmupQueue.push_front({ rec });
+                warmup::g_warmupQueue.push_front({ rec, true });
             else
-                warmup::g_warmupQueue.push_back({ rec });
+                warmup::g_warmupQueue.push_back({ rec, false });
             warmup::g_statQueued.fetch_add(1, std::memory_order_relaxed);
         }
         StartWarmupScheduler();
