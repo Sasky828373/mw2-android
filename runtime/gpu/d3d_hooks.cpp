@@ -55,6 +55,7 @@ GUEST_HOOK(T_D3D_Present)
     GUEST_ORIG(T_D3D_Present)(ctx, base);
     pacing::Note(pacing::kPresentEnd);
     gpu::Presented();
+    frame_rate::PaceHost();
     stutters::TitlePresented();
 }
 
