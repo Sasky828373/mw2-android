@@ -543,8 +543,13 @@ namespace vk::renderer::detail
     // after the ones before it (recorder.h). `call` takes the command buffer
     // and copies everything else it uses: no pointer to a local, and no `g.`,
     // which is the consumer's and will have moved on by the time it runs.
+    // Keep deferred geometry ahead of every non-draw command (barriers, pass
+    // transitions, query boundaries and submissions). This preserves the
+    // guest's strict command order while allowing adjacent draws to coalesce.
+    void FlushDrawBatch();
     template <class Call> inline void Record(Call&& call)
     {
+        FlushDrawBatch();
         vk::record::Command(std::forward<Call>(call));
     }
 
