@@ -163,8 +163,21 @@ PPC_FUNC(__imp__RtlEnterCriticalSection)
 {
     const uint32_t cs = ctx.r3.u32, me = CurrentKThread(ctx);
     if (TakeIfOwned(cs, me)) return;
-    for (uint32_t spin = *GuestPtr<uint8_t>(cs + 1) * 256u; spin; spin--)
+    uint32_t spins = *GuestPtr<uint8_t>(cs + 1) * 256u;
+#ifdef MW2_ANDROID
+    // A guest requests up to 65k CAS attempts; on a phone that can burn a
+    // performance core and contend with the owner. Briefly spin, then let
+    // the existing dispatcher event block without consuming CPU cycles.
+    spins = std::min(spins, 2048u);
+#endif
+    for (; spins; --spins)
+    {
         if (CompareExchange(cs + kLockCount, uint32_t(-1), 0)) { Own(cs, me); return; }
+#ifdef MW2_ANDROID
+        // Only after contention: reduce cache-line traffic and core power.
+        if ((spins & 63u) == 0) std::this_thread::yield();
+#endif
+    }
     // Counted in before sleeping, so the owner's leave knows to wake a waiter.
     if (Add(cs + kLockCount, 1) != 0)
         if (auto event = ObjectAt(cs))

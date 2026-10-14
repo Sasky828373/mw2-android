@@ -55,8 +55,8 @@ namespace vk::renderer::detail
         constexpr uint32_t bytes = kWindowCount * 16;
 
         State::Cached& cache = g.constantWindows[slot];
-        if (cache.valid && cache.base == base &&
-            cache.stamp == r.StampOf(first, kWindowCount * 4))
+        const uint64_t stamp = r.StampOf(first, kWindowCount * 4);
+        if (cache.valid && cache.base == base && cache.stamp == stamp)
         {
             g.arenaReused[kArenaConstants] += bytes;
             return cache.at;
@@ -65,7 +65,7 @@ namespace vk::renderer::detail
         const uint32_t at = Allocate(bytes, kArenaConstants);
         if (at == UINT32_MAX) return at;
         std::memcpy(g.arenaMapped + at, &r.values[first], bytes);
-        cache = { r.StampOf(first, kWindowCount * 4), base, at, true, kWindowCount };
+        cache = { stamp, base, at, true, kWindowCount };
         return at;
     }
 
@@ -126,6 +126,36 @@ namespace vk::renderer::detail
         if (out.pixelFloats == UINT32_MAX) return out;
         if (g.drawRecord)
             NoteConstantWindows(r, ConstantsNeeded(program), ConstantsNeeded(pixelProgram));
+
+        // Boolean and loop registers can change while the vertex fetch
+        // window remains identical. Refresh them independently: the previous
+        // early return reused stale uniform offsets on those draws.
+        const uint64_t boolStamp = r.StampOf(gpu::kConstantBaseBool, 8);
+        if (g.booleans.valid && g.booleans.stamp == boolStamp)
+        {
+            g.arenaReused[kArenaConstants] += 8 * 4;
+            out.booleans = g.booleans.at;
+        }
+        else
+        {
+            out.booleans = CopyIntoArena(&r.values[gpu::kConstantBaseBool], 8 * 4, kArenaConstants);
+            if (out.booleans == UINT32_MAX) return out;
+            g.booleans = { boolStamp, 0, out.booleans, true };
+        }
+
+        const uint64_t loopStamp = r.StampOf(gpu::kConstantBaseLoop, 32);
+        if (g.loops.valid && g.loops.stamp == loopStamp)
+        {
+            g.arenaReused[kArenaConstants] += 32 * 4;
+            out.loops = g.loops.at;
+        }
+        else
+        {
+            out.loops = CopyIntoArena(&r.values[gpu::kConstantBaseLoop], 32 * 4, kArenaConstants);
+            if (out.loops == UINT32_MAX) return out;
+            g.loops = { loopStamp, 0, out.loops, true };
+        }
+
 
         // The assembled block depends on the fetch registers and on which groups
         // the shader reads, and the vertex copies it points at stay where they are
@@ -267,32 +297,6 @@ namespace vk::renderer::detail
                 }
                 entry[0] = found->base | type;
             }
-        }
-
-        const uint64_t boolStamp = r.StampOf(gpu::kConstantBaseBool, 8);
-        if (g.booleans.valid && g.booleans.stamp == boolStamp)
-        {
-            g.arenaReused[kArenaConstants] += 8 * 4;
-            out.booleans = g.booleans.at;
-        }
-        else
-        {
-            out.booleans = CopyIntoArena(&r.values[gpu::kConstantBaseBool], 8 * 4, kArenaConstants);
-            if (out.booleans == UINT32_MAX) return out;
-            g.booleans = { boolStamp, 0, out.booleans, true };
-        }
-
-        const uint64_t loopStamp = r.StampOf(gpu::kConstantBaseLoop, 32);
-        if (g.loops.valid && g.loops.stamp == loopStamp)
-        {
-            g.arenaReused[kArenaConstants] += 32 * 4;
-            out.loops = g.loops.at;
-        }
-        else
-        {
-            out.loops = CopyIntoArena(&r.values[gpu::kConstantBaseLoop], 32 * 4, kArenaConstants);
-            if (out.loops == UINT32_MAX) return out;
-            g.loops = { loopStamp, 0, out.loops, true };
         }
 
         g.fetchBlock = { fetchStamp, VertexRange(lowestVertex, highestVertex), out.fetch, true };
