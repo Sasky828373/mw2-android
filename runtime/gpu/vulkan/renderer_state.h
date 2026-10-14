@@ -535,6 +535,7 @@ namespace vk::renderer::detail
         PFN_vkCmdSetDepthCompareOpEXT setDepthCompareOp = nullptr;
         PFN_vkCmdSetStencilTestEnableEXT setStencilTestEnable = nullptr;
         PFN_vkCmdSetStencilOpEXT setStencilOp = nullptr;
+        PFN_vkCmdDrawMultiEXT drawMulti = nullptr;
     };
     inline Dispatch dispatch;
 
