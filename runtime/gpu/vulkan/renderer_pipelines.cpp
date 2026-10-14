@@ -8,6 +8,7 @@
 #include "../../report.h"
 #include "pipeline.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -28,6 +29,23 @@ namespace vk::renderer::detail
     namespace
     {
         std::mutex g_shadersMutex;
+        // The command processor repeatedly uses the same shader pair for a
+        // group of draws. Avoid two std::map searches and two mutex acquisitions
+        // on every draw. std::map node addresses stay stable as new shaders
+        // arrive; lifecycle generation prevents stale pointers after restart.
+        std::atomic<uint64_t> g_shaderLookupGeneration{ 1 };
+        struct HotShader
+        {
+            uint64_t generation = 0;
+            uint64_t hash = 0;
+            const Shader* shader = nullptr;
+        };
+        thread_local HotShader t_hotShaders[2];
+    }
+
+    void InvalidateShaderLookupCache()
+    {
+        g_shaderLookupGeneration.fetch_add(1, std::memory_order_relaxed);
     }
 
     // A shader the title has not drawn with before here: taken from the ones
@@ -36,11 +54,18 @@ namespace vk::renderer::detail
     const Shader* ShaderFor(shader::Type type, uint64_t hash, const uint32_t* code, size_t words)
     {
         if (!code || !words) return nullptr;
+        const uint64_t generation = g_shaderLookupGeneration.load(std::memory_order_relaxed);
+        HotShader& hot = t_hotShaders[type == shader::Type::Pixel ? 1 : 0];
+        if (hot.generation == generation && hot.hash == hash)
+            return hot.shader;
         {
             std::lock_guard lock(g_shadersMutex);
             auto found = g.shaders.find(hash);
             if (found != g.shaders.end())
-                return found->second.module ? &found->second : nullptr;
+            {
+                hot = { generation, hash, found->second.module ? &found->second : nullptr };
+                return hot.shader;
+            }
         }
 
         Shader entry;
@@ -64,7 +89,8 @@ namespace vk::renderer::detail
                                       : entry.translation.error.c_str());
         std::lock_guard lock(g_shadersMutex);
         auto& stored = g.shaders.emplace(hash, std::move(entry)).first->second;
-        return ok ? &stored : nullptr;
+        hot = { generation, hash, ok ? &stored : nullptr };
+        return hot.shader;
     }
 
     VkCompareOp CompareOp(uint32_t function)

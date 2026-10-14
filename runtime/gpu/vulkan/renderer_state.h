@@ -661,6 +661,7 @@ namespace vk::renderer::detail
 
     // ---- renderer_pipelines.cpp ----
     const Shader* ShaderFor(shader::Type type, uint64_t hash, const uint32_t* code, size_t words);
+    void InvalidateShaderLookupCache();
     VkPrimitiveTopology TopologyFor(uint32_t primitive);
     // Every piece of a pipeline's state, filled in for one key. A whole
     // pipeline takes all of it; each library takes the part that is its own.

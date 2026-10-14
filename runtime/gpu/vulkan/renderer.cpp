@@ -453,6 +453,7 @@ bool vk::renderer::Initialise()
     LOGI("renderer: ready on %s, depth %s, %u MB frame arena%s", vk::pipeline::DeviceName(),
          g.depthFormat == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8", g.arenaBytes >> 20,
          g.shadowBase ? " and a shadow of guest memory behind it" : ", no shadow of guest memory");
+    InvalidateShaderLookupCache();
     StartPreparing();
     PrewarmFromCache();
     // A lost device ends the run, the way closing the window does.
@@ -494,6 +495,7 @@ void vk::renderer::Shutdown()
     }
     for (auto& [key, target] : g.targets) DestroyTarget(target);
     g.pipelines.clear();
+    InvalidateShaderLookupCache();
     g.shaders.clear();
     g.targets.clear();
     for (uint32_t i = 0; i < kPresentImages; i++)
