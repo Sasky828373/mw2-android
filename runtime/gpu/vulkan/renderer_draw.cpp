@@ -84,9 +84,14 @@ namespace vk::renderer::detail
         scaled = 0;
         Stopwatch watch(g.textureNanoseconds);
         uint64_t ids[vk::textures::kSlots]{};
-        for (uint32_t slot = 0; slot < vk::textures::kSlots; slot++)
+        // Most materials read only a handful of the 32 possible texture slots.
+        // Iterate active fetch bits directly instead of scanning empty slots
+        // for every draw (std::countr_zero is a single CLZ/RBIT on ARM64).
+        uint32_t remaining = mask;
+        while (remaining)
         {
-            if (!(mask & (1u << slot))) continue;
+            const uint32_t slot = std::countr_zero(remaining);
+            remaining &= remaining - 1;
             gpu::TextureFetch fetch;
             for (uint32_t i = 0; i < 6; i++)
                 fetch.d[i] = r[gpu::kConstantBaseFetch + slot * 6 + i];
