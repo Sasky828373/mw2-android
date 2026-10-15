@@ -351,6 +351,17 @@ bool vk::renderer::Initialise()
     dispatch.setDepthCompareOp = PFN_vkCmdSetDepthCompareOpEXT(command("vkCmdSetDepthCompareOpEXT", "vkCmdSetDepthCompareOp"));
     dispatch.setStencilTestEnable = PFN_vkCmdSetStencilTestEnableEXT(command("vkCmdSetStencilTestEnableEXT", "vkCmdSetStencilTestEnable"));
     dispatch.setStencilOp = PFN_vkCmdSetStencilOpEXT(command("vkCmdSetStencilOpEXT", "vkCmdSetStencilOp"));
+    dispatch.drawMulti = PFN_vkCmdDrawMultiEXT(command("vkCmdDrawMultiEXT"));
+    dispatch.drawMultiIndexed = PFN_vkCmdDrawMultiIndexedEXT(command("vkCmdDrawMultiIndexedEXT"));
+    if (dispatch.drawMulti || dispatch.drawMultiIndexed)
+    {
+        VkPhysicalDeviceMultiDrawPropertiesEXT limits{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT };
+        VkPhysicalDeviceProperties2 props{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        props.pNext = &limits;
+        vkGetPhysicalDeviceProperties2(g.physical, &props);
+        dispatch.maxMultiDrawCount = limits.maxMultiDrawCount;
+    }
     if (!dispatch.beginRendering || !dispatch.endRendering || !dispatch.setCullMode ||
         !dispatch.setStencilOp)
     {
@@ -442,6 +453,8 @@ bool vk::renderer::Initialise()
     LOGI("renderer: ready on %s, depth %s, %u MB frame arena%s", vk::pipeline::DeviceName(),
          g.depthFormat == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8", g.arenaBytes >> 20,
          g.shadowBase ? " and a shadow of guest memory behind it" : ", no shadow of guest memory");
+    InvalidateShaderLookupCache();
+    g_pipelineLookupVersion.fetch_add(1, std::memory_order_release);
     StartPreparing();
     PrewarmFromCache();
     // A lost device ends the run, the way closing the window does.
@@ -482,7 +495,9 @@ void vk::renderer::Shutdown()
         if (shader.module) vkDestroyShaderModule(g.device, shader.module, nullptr);
     }
     for (auto& [key, target] : g.targets) DestroyTarget(target);
+    g_pipelineLookupVersion.fetch_add(1, std::memory_order_release);
     g.pipelines.clear();
+    InvalidateShaderLookupCache();
     g.shaders.clear();
     g.targets.clear();
     for (uint32_t i = 0; i < kPresentImages; i++)

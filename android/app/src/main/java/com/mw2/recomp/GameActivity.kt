@@ -686,7 +686,8 @@ class GameActivity : AppCompatActivity(), NativeListener {
         if (prefs.renderScale in 1..3) {
             NativeBridge.nativeSetOption("MW2_SCALE", prefs.renderScale.toString())
         }
-        NativeBridge.nativeSetOption("MW2_STUTTERS", "1")
+        // Per-frame stutter tracing is opt-in; do not pay for it on every release frame.
+        NativeBridge.nativeSetOption("MW2_STUTTERS", "")
         NativeBridge.nativeSetOption(
             "MW2_TEXTURE_BUDGET_MB",
             if (prefs.textureBudgetMB > 0) prefs.textureBudgetMB.toString() else "",

@@ -433,8 +433,23 @@ namespace
         std::vector<VkSurfaceFormatKHR> formats(formatCount);
         vkGetPhysicalDeviceSurfaceFormatsKHR(g.physical, g.surface, &formatCount, formats.data());
         VkSurfaceFormatKHR chosen = formats[0];
+#ifdef MW2_ANDROID
+        // The renderer hands the presenter RGBA8. On a panel advertising an
+        // RGBA8 swapchain, keeping that format avoids BGRA conversion on each
+        // frame's transfer and enables the exact-size vkCmdCopyImage path.
+        // Fall back to the original BGRA8 preference when RGBA8 is absent.
+        bool foundNative = false;
         for (const auto& f : formats)
-            if (f.format == VK_FORMAT_B8G8R8A8_UNORM) { chosen = f; break; }
+            if (f.format == VK_FORMAT_R8G8B8A8_UNORM)
+            {
+                chosen = f;
+                foundNative = true;
+                break;
+            }
+        if (!foundNative)
+#endif
+            for (const auto& f : formats)
+                if (f.format == VK_FORMAT_B8G8R8A8_UNORM) { chosen = f; break; }
         g.swapchainFormat = chosen.format;
 
         VkSwapchainCreateInfoKHR info{ VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
@@ -821,8 +836,12 @@ namespace
         if (g.remakeSwapchain || !g.swapchain) { LetGo(); return; }
 
         Frame& frame = g.frames[g.frameIndex];
-        if (vk::pipeline::Failed(vkWaitForFences(g.device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX),
-                                 "the presenter's fence"))
+        // Reusing a completed frame slot must not enter a blocking driver wait.
+        // This still waits for outstanding submissions before resetting the slot.
+        VkResult ready = vkGetFenceStatus(g.device, frame.inFlight);
+        if (ready == VK_NOT_READY)
+            ready = vkWaitForFences(g.device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX);
+        if (vk::pipeline::Failed(ready, "the presenter's fence"))
             return;
 
         // FIFO: this is where the window waits for the display, with the
@@ -898,8 +917,25 @@ namespace
                                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
             }
-            vkCmdBlitImage(frame.commands, shown.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+            // An exact-size RGBA frame needs no sample filtering or format
+            // conversion. Use a direct transfer where the surface advertises
+            // the same format; preserve the blit for scaling and BGRA panels.
+            if (!bars && shown.width == g.extent.width &&
+                shown.height == g.extent.height &&
+                g.swapchainFormat == VK_FORMAT_R8G8B8A8_UNORM)
+            {
+                VkImageCopy copy{};
+                copy.srcSubresource = blit.srcSubresource;
+                copy.dstSubresource = blit.dstSubresource;
+                copy.extent = { shown.width, shown.height, 1 };
+                vkCmdCopyImage(frame.commands, shown.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            }
+            else
+            {
+                vkCmdBlitImage(frame.commands, shown.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+            }
         }
         else
         {

@@ -57,11 +57,13 @@ void vk::textures::BeginUploads(uint32_t) {}
 #else
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstring>
 #include <map>
 #include <deque>
+#include <functional>
 #include <string>
 #include <unordered_map>
 
@@ -238,18 +240,44 @@ namespace
         // held once.
         std::unordered_map<std::array<uint32_t, 6>, uint64_t, WordsHash> byFetch;
         std::unordered_map<std::array<uint32_t, 6>, uint64_t, WordsHash> byContent;
+        // A draw generally binds the same few material fetches repeatedly.
+        // Keep four hot six-dword lookups inline to skip hash probing while
+        // still refreshing dynamic guest texture contents on every bind.
+        struct HotFetch {
+            std::array<uint32_t, 6> key{};
+            uint64_t id = 0;
+            bool valid = false;
+        };
+        std::array<HotFetch, 4> hotFetch{};
+        uint32_t nextHotFetch = 0;
         std::vector<uint64_t> freeIds;                // slots of g.images to use again
         std::vector<VkSampler> samplerList;           // an id's sampler, by its index less one
-        std::map<uint64_t, uint32_t> samplerIndex;    // sampler key -> that index
-        std::map<uint64_t, uint64_t> adopted;         // caller's key -> id
-        std::map<uint64_t, VkSampler> samplers;
+        // Sampler and adopted-resolve lookups happen for almost every textured
+        // draw. No callers depend on ordering; hash tables avoid three separate
+        // red-black-tree walks and improve hot-material locality.
+        std::unordered_map<uint64_t, uint32_t> samplerIndex; // sampler key -> index
+        std::unordered_map<uint64_t, uint64_t> adopted;      // resolve key -> image id
+        std::unordered_map<uint64_t, VkSampler> samplers;    // sampler key -> handle
         // A set, the pool it came from and the frame it was last handed out
         // in: one nothing has bound for kUnusedFrames goes back to its pool.
         struct Set { VkDescriptorSet set; uint32_t pool; uint64_t lastUsed; };
         std::unordered_map<std::array<uint64_t, vk::textures::kSlots>, Set, WordsHash> sets;
+        // Consecutive draws normally reuse exactly the same 32 texture slots.
+        // Cache the last lookup's node, not just the handle, so its last-used
+        // frame can still be refreshed without hashing 32 uint64_t keys.
+        // Unordered-map node addresses survive rehash; every erase/clear below
+        // explicitly invalidates this pointer.
+        std::array<uint64_t, vk::textures::kSlots> hotSetKey{};
+        Set* hotSet = nullptr;
         // Sets dropped from the cache all at once, which commands not yet run
         // may still bind: freed when they are that old too.
-        std::vector<Set> retiredSets;
+        std::deque<Set> retiredSets;
+        std::array<uint64_t, vk::textures::kSlots> nextSetSweep{};
+        bool nextSetSweepValid = false;
+        // Image slots must not be recycled while a cached descriptor can
+        // still refer to their old VkImageView. Incremental sweeps may take
+        // more than 64 frames when there are thousands of materials.
+        uint64_t lastFullSetSweepFrame = 0;
         uint32_t allocPool = 0;   // the pool the last set came from
         // Images nothing names any more, waiting to be destroyed a few a frame.
         std::deque<Image> doomed;
@@ -259,7 +287,10 @@ namespace
 
         uint32_t uploads = 0, failures = 0, descriptorSets = 0;
         uint64_t uploadedBytes = 0;
-        uint64_t liveBytes = 0, budget = 0;   // what the uploaded images hold, and may
+        uint64_t liveBytes = 0;
+        // SetBudget may be called from Android's memory-pressure callback
+        // while the GPU consumer is streaming textures on another thread.
+        std::atomic<uint64_t> budget{ 0 };
         uint64_t evicted = 0, evictedBytes = 0, evictionPasses = 0;
         uint64_t stale = 0, staleBytes = 0;   // released because their memory was rewritten
         uint64_t staleNotReally = 0;          // kept: a page was written, their bytes were not
@@ -1034,10 +1065,18 @@ void vk::textures::Shutdown()
     g.freeIds.clear();
     g.byFetch.clear();
     g.byContent.clear();
+    g.hotFetch = {};
+    g.nextHotFetch = 0;
+    g.hotSet = nullptr;
     g.sets.clear();
+    g.nextSetSweepValid = false;
+    g.lastFullSetSweepFrame = 0;
     g.retiredSets.clear();
     g.samplerList.clear();
     g.samplerIndex.clear();
+    // Adopted resolved views refer to image slots. If the renderer restarts
+    // after surface/device recreation, their previous one-based IDs are stale.
+    g.adopted.clear();
     DestroyImage(g.fallback);
     DestroyImage(g.fallbackCube);
     DestroyImage(g.fallback3D);
@@ -1239,7 +1278,7 @@ namespace
 uint64_t vk::textures::FrameNumber() { return g.frame; }
 
 uint64_t vk::textures::LiveBytes() { return g.liveBytes; }
-uint64_t vk::textures::Budget() { return g.budget; }
+uint64_t vk::textures::Budget() { return g.budget.load(std::memory_order_relaxed); }
 
 // A budget the system asked for. The eviction pass is left to the next frame
 // -- it waits for the device, and the caller is whichever thread Android
@@ -1247,7 +1286,7 @@ uint64_t vk::textures::Budget() { return g.budget; }
 void vk::textures::SetBudget(uint64_t bytes)
 {
     const uint64_t floor = 48ull << 20;   // below this nothing would stay cached
-    g.budget = std::max(bytes, floor);
+    g.budget.store(std::max(bytes, floor), std::memory_order_relaxed);
 }
 
 void vk::textures::MemoryWritten(uint32_t physicalAddress, uint32_t size)
@@ -1287,6 +1326,8 @@ namespace
     // not yet run may still bind them, so they are freed with the unused.
     void RetireSets()
     {
+        g.hotSet = nullptr;
+        g.nextSetSweepValid = false;
         for (const auto& [key, entry] : g.sets)
             g.retiredSets.push_back({ entry.set, entry.pool, g.frame });
         g.sets.clear();
@@ -1294,19 +1335,42 @@ namespace
 
     void SweepSets()
     {
-        for (auto entry = g.sets.begin(); entry != g.sets.end();)
+        // Descriptor-set retirement used to visit and destroy *every* stale
+        // entry once every 64 frames. Large levels then paid thousands of
+        // hash probes and vkFreeDescriptorSets in one unlucky frame.
+        // Amortise at most 64 probes/frees per frame, retaining a key rather
+        // than an iterator (insertions can rehash unordered_map iterators).
+        // Keep the average probing work near the old one-full-pass-per-64-
+        // frames cadence, rather than scanning even a tiny cache 64 times
+        // more often than before. Cap peak driver frees at 32 per frame.
+        const size_t scanBudget = std::clamp<size_t>(
+            (g.sets.size() + kSweepFrames - 1) / kSweepFrames, 1, 32);
+        auto entry = g.nextSetSweepValid ? g.sets.find(g.nextSetSweep)
+                                         : g.sets.begin();
+        if (entry == g.sets.end()) entry = g.sets.begin();
+        for (size_t examined = 0; examined < scanBudget && entry != g.sets.end();
+             ++examined)
         {
             if (g.frame - entry->second.lastUsed < kUnusedFrames) { ++entry; continue; }
+            if (g.hotSet == &entry->second) g.hotSet = nullptr;
             FreeSet(entry->second);
             entry = g.sets.erase(entry);
         }
-        size_t kept = 0;
-        for (const State::Set& entry : g.retiredSets)
+        g.nextSetSweepValid = entry != g.sets.end();
+        if (g.nextSetSweepValid) g.nextSetSweep = entry->first;
+        else g.lastFullSetSweepFrame = g.frame;
+
+        // Retired descriptor sets are appended in frame order. A deque can
+        // release just the oldest completed sets without moving all survivors
+        // (or freeing thousands on the same frame).
+        const size_t retireBudget = std::clamp<size_t>(
+            (g.retiredSets.size() + kSweepFrames - 1) / kSweepFrames, 1, 32);
+        for (size_t count = 0; count < retireBudget && !g.retiredSets.empty(); ++count)
         {
-            if (g.frame - entry.lastUsed < kUnusedFrames) g.retiredSets[kept++] = entry;
-            else FreeSet(entry);
+            if (g.frame - g.retiredSets.front().lastUsed < kUnusedFrames) break;
+            FreeSet(g.retiredSets.front());
+            g.retiredSets.pop_front();
         }
-        g.retiredSets.resize(kept);
     }
 
     // Whether an image can be let go: one of the cache's own, and unbound for
@@ -1315,13 +1379,22 @@ namespace
     bool Idle(const Image& image)
     {
         return image.image && !image.borrowed && !image.pinned &&
-               g.frame - image.lastBound >= kUnusedFrames + kSweepFrames;
+               g.frame - image.lastBound >= kUnusedFrames + kSweepFrames &&
+               // A 64-frame age margin alone is insufficient if a large
+               // incremental sweep has not yet reached all cached sets.
+               // Keep the image alive (including its reusable one-based id)
+               // until a whole descriptor scan has completed after expiry.
+               g.lastFullSetSweepFrame >= image.lastBound + kUnusedFrames;
     }
 
     // The image stops existing for the cache now; its Vulkan objects are
     // destroyed over the next frames (DestroyDoomed).
     void Release(uint64_t id)
     {
+        // A recycled one-based id may now refer to a different VkImageView.
+        // Drop any hot fetch whose image slot is being evicted.
+        for (auto& hot : g.hotFetch)
+            if (hot.valid && (hot.id & kImageBits) == id) hot.valid = false;
         Image& image = g.images[size_t(id - 1)];
         for (const auto& name : image.names)
             if (auto entry = g.byFetch.find(name);
@@ -1391,14 +1464,20 @@ namespace
         for (size_t i = 0; i < g.images.size(); i++)
             if (Idle(g.images[i])) oldest.push_back({ g.images[i].lastBound, uint64_t(i + 1) });
         if (oldest.empty()) return;
-        std::sort(oldest.begin(), oldest.end());
-        const uint64_t target = g.budget / 4 * 3;
+        // Sorting every idle texture costs O(n log n) during budget pressure
+        // and produces a visible CPU spike when the cache has thousands of
+        // entries. A min-heap builds in O(n), then evicts the least-recently
+        // used image in O(log n) until the budget is recovered.
+        std::make_heap(oldest.begin(), oldest.end(), std::greater<>{});
+        const uint64_t target = g.budget.load(std::memory_order_relaxed) / 4 * 3;
         uint64_t count = 0, bytes = 0;
-        for (const auto& [lastBound, id] : oldest)
+        while (g.liveBytes > target && !oldest.empty())
         {
-            if (g.liveBytes <= target) break;
+            std::pop_heap(oldest.begin(), oldest.end(), std::greater<>{});
+            const uint64_t id = oldest.back().second;
+            oldest.pop_back();
             bytes += g.images[size_t(id - 1)].bytes;
-            count++;
+            ++count;
             Release(id);
         }
         g.evicted += count;
@@ -1449,11 +1528,10 @@ void vk::textures::NewFrame()
                  (unsigned long long)memory.blocks, (unsigned long long)(memory.blockBytes >> 20),
                  g.sets.size());
         }
-    if (g.frame % kSweepFrames == 0)
-    {
-        SweepSets();
-        if (g.liveBytes > g.budget) Evict();
-    }
+    // Bounded set clean-up every frame avoids periodic allocator spikes.
+    SweepSets();
+    if (g.frame % kSweepFrames == 0 &&
+        g.liveBytes > g.budget.load(std::memory_order_relaxed)) Evict();
     SweepImages();
     DestroyDoomed();
 }
@@ -1544,16 +1622,29 @@ uint64_t vk::textures::Upload(const gpu::TextureFetch& fetch, const char** error
 
     std::array<uint32_t, 6> key{};
     for (uint32_t i = 0; i < 6; i++) key[i] = fetch.d[i];
-    auto found = g.byFetch.find(key);
-    if (found != g.byFetch.end())
-    {
-        if (Image* image = Find(found->second))
+    const auto bindCached = [&](uint64_t id) -> uint64_t {
+        if (Image* image = Find(id))
         {
             image->lastBound = g.frame;
             image->boundSegment = g.segment;
         }
-        RefreshIfChanged(found->second & kImageBits);
-        return found->second;
+        // Fast lookup must never omit write-watch / signature invalidation:
+        // textures can be rewritten in guest RAM with the same fetch words.
+        RefreshIfChanged(id & kImageBits);
+        return id;
+    };
+    const auto remember = [&](uint64_t id) {
+        auto& hot = g.hotFetch[g.nextHotFetch++ % g.hotFetch.size()];
+        hot = { key, id, true };
+    };
+    for (const auto& hot : g.hotFetch)
+        if (hot.valid && hot.key == key)
+            return bindCached(hot.id);
+    auto found = g.byFetch.find(key);
+    if (found != g.byFetch.end())
+    {
+        remember(found->second);
+        return bindCached(found->second);
     }
 
     // The same texture under another sampler state: the image is held already.
@@ -1568,7 +1659,10 @@ uint64_t vk::textures::Upload(const gpu::TextureFetch& fetch, const char** error
         image.names.push_back(key);
         g.shared++;
         RefreshIfChanged(held->second);
-        return g.byFetch[key] = held->second | (uint64_t(sampler) << kSamplerShift);
+        const uint64_t named = held->second | (uint64_t(sampler) << kSamplerShift);
+        g.byFetch[key] = named;
+        remember(named);
+        return named;
     }
 
     stutters::Timed timed(stutters::kNewTextures);
@@ -1614,6 +1708,7 @@ uint64_t vk::textures::Upload(const gpu::TextureFetch& fetch, const char** error
     // A failure is cached too: the same six dwords fail the same way, and a
     // texture bound every frame would otherwise fail thousands of times.
     g.byFetch[key] = named;
+    remember(named);
     return named;
 }
 
@@ -1790,10 +1885,17 @@ void* vk::textures::DescriptorSet(const uint64_t ids[kSlots], const uint8_t* kin
     std::array<uint64_t, kSlots> key{};
     for (uint32_t i = 0; i < kSlots; i++)
         key[i] = ids[i] | (uint64_t(kinds ? kinds[i] : 0) << 62);
+    if (g.hotSet && g.hotSetKey == key)
+    {
+        g.hotSet->lastUsed = g.frame;
+        return g.hotSet->set;
+    }
     auto found = g.sets.find(key);
     if (found != g.sets.end())
     {
         found->second.lastUsed = g.frame;
+        g.hotSetKey = key;
+        g.hotSet = &found->second;
         return found->second.set;
     }
 
@@ -1851,7 +1953,10 @@ void* vk::textures::DescriptorSet(const uint64_t ids[kSlots], const uint8_t* kin
         writes[i].pImageInfo = &images[i];
     }
     vkUpdateDescriptorSets(g.device, kSlots, writes, 0, nullptr);
-    g.sets[key] = { set, g.allocPool, g.frame };
+    auto [created, inserted] = g.sets.emplace(key, State::Set{ set, g.allocPool, g.frame });
+    // One consumer owns descriptor-cache writes, so this is always a new key.
+    g.hotSetKey = key;
+    g.hotSet = &created->second;
     g.descriptorSets++;
     return set;
 }

@@ -25,6 +25,7 @@
 #include "../../stutters.h"
 #include "../../words_hash.h"
 
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <string>
@@ -535,6 +536,9 @@ namespace vk::renderer::detail
         PFN_vkCmdSetDepthCompareOpEXT setDepthCompareOp = nullptr;
         PFN_vkCmdSetStencilTestEnableEXT setStencilTestEnable = nullptr;
         PFN_vkCmdSetStencilOpEXT setStencilOp = nullptr;
+        PFN_vkCmdDrawMultiEXT drawMulti = nullptr;
+        PFN_vkCmdDrawMultiIndexedEXT drawMultiIndexed = nullptr;
+        uint32_t maxMultiDrawCount = 0;
     };
     inline Dispatch dispatch;
 
@@ -542,8 +546,13 @@ namespace vk::renderer::detail
     // after the ones before it (recorder.h). `call` takes the command buffer
     // and copies everything else it uses: no pointer to a local, and no `g.`,
     // which is the consumer's and will have moved on by the time it runs.
+    // Keep deferred geometry ahead of every non-draw command (barriers, pass
+    // transitions, query boundaries and submissions). This preserves the
+    // guest's strict command order while allowing adjacent draws to coalesce.
+    void FlushDrawBatch();
     template <class Call> inline void Record(Call&& call)
     {
+        FlushDrawBatch();
         vk::record::Command(std::forward<Call>(call));
     }
 
@@ -594,7 +603,7 @@ namespace vk::renderer::detail
                          uint32_t guestFormat);
     void DestroyTarget(Target& target);
     // A new target leaves UNDEFINED and is cleared before a pass loads it.
-    void ClearNewTarget(Target& target);
+    bool ClearNewTarget(Target& target);
     // Opens a rendering instance over the two targets (closing the one open,
     // if it is another), with the barriers a render pass's dependencies were.
     void BeginRendering(const Target& colour, const Target& depth, uint32_t width,
@@ -629,7 +638,7 @@ namespace vk::renderer::detail
     uint64_t CompletedSerial();
     void NoteCompleted();
     // Destroying an image the GPU may still use.
-    void RetireBeforeDestroy();
+    bool RetireBeforeDestroy();
     // Until the GPU has finished the submission a slot holds, if it holds one.
     bool WaitForSlot(State::Slot& slot, const char* what);
     void FinishFrame(VkImage present);
@@ -653,6 +662,7 @@ namespace vk::renderer::detail
 
     // ---- renderer_pipelines.cpp ----
     const Shader* ShaderFor(shader::Type type, uint64_t hash, const uint32_t* code, size_t words);
+    void InvalidateShaderLookupCache();
     VkPrimitiveTopology TopologyFor(uint32_t primitive);
     // Every piece of a pipeline's state, filled in for one key. A whole
     // pipeline takes all of it; each library takes the part that is its own.
@@ -690,6 +700,7 @@ namespace vk::renderer::detail
     // Every finished frame, so the compiling waits while the world is drawn.
     void NoteFrame(bool world);
     extern std::mutex g_pipelinesMutex;
+    extern std::atomic<uint64_t> g_pipelineLookupVersion;
     void StartPreparing();
     void StopPreparing();
     void ReportPreparing();

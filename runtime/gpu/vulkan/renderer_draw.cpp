@@ -7,12 +7,16 @@
 #include "../../guest.h"
 #include "../../kernel/physical.h"
 #include "../../log.h"
+#include "../../env.h"
 #include "../internal.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <mutex>
+#include <vector>
 
 #ifdef MW2_HAVE_VULKAN
 
@@ -81,9 +85,14 @@ namespace vk::renderer::detail
         scaled = 0;
         Stopwatch watch(g.textureNanoseconds);
         uint64_t ids[vk::textures::kSlots]{};
-        for (uint32_t slot = 0; slot < vk::textures::kSlots; slot++)
+        // Most materials read only a handful of the 32 possible texture slots.
+        // Iterate active fetch bits directly instead of scanning empty slots
+        // for every draw (std::countr_zero is a single CLZ/RBIT on ARM64).
+        uint32_t remaining = mask;
+        while (remaining)
         {
-            if (!(mask & (1u << slot))) continue;
+            const uint32_t slot = std::countr_zero(remaining);
+            remaining &= remaining - 1;
             gpu::TextureFetch fetch;
             for (uint32_t i = 0; i < 6; i++)
                 fetch.d[i] = r[gpu::kConstantBaseFetch + slot * 6 + i];
@@ -205,21 +214,141 @@ namespace vk::renderer::detail
                     vkCmdSetStencilReference(command, faces[i], state.Reference());
                 }
             }
-            if (set & kConstants)
+            // Adjacent descriptor sets 0 and 1 can be bound together when
+            // both change, avoiding one Vulkan dispatch per such draw.
+            if ((set & (kConstants | kTextures)) == (kConstants | kTextures))
+            {
+                static_assert(bindings::kTextureSet == bindings::kConstantSet + 1);
+                const VkDescriptorSet sets[] = { constantSet, textureSet };
+                vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+                                        bindings::kConstantSet, 2, sets,
+                                        bindings::kConstantBlocks, dynamic);
+            }
+            else if (set & kConstants)
                 vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
                                         bindings::kConstantSet, 1, &constantSet,
                                         bindings::kConstantBlocks, dynamic);
-            if (set & kTextures)
+            else if (set & kTextures)
                 vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
                                         bindings::kTextureSet, 1, &textureSet, 0, nullptr);
             if (set & kAlphaTest)
                 vkCmdPushConstants(command, layout, VK_SHADER_STAGE_FRAGMENT_BIT,
                                    bindings::kPixelPushOffset, sizeof push, push);
             if (set & kIndexBuffer) vkCmdBindIndexBuffer(command, indexBuffer, 0, indexType);
-            if (set & kIndexed) vkCmdDrawIndexed(command, count, 1, firstIndex, 0, 0);
-            else vkCmdDraw(command, count, 1, 0, 0);
+            // Zero-vertex draws contribute no geometry. Keep the state
+            // commands above intact, but avoid an empty GPU draw command.
+            if (count != 0)
+            {
+                if (set & kIndexed) vkCmdDrawIndexed(command, count, 1, firstIndex, 0, 0);
+                else vkCmdDraw(command, count, 1, 0, 0);
+            }
         }
     };
+
+    // Only the ring-consumer thread appends here. The recorder receives an
+    // owning copy of each batch, so no pending draw points at guest memory.
+    constexpr size_t kBufferedDraws = 64;
+    // Producer-to-recorder batches keep ownership of their DrawOps until the
+    // Vulkan commands are recorded. Recycle completed vector storage back to
+    // the producer instead of allocating and freeing a 64-draw vector for
+    // every material/pass boundary. Bound the spare pool to avoid idle RAM.
+    struct DrawBatchPool
+    {
+        std::mutex mutex;
+        std::vector<std::vector<DrawOp>> spare;
+        DrawBatchPool() { spare.reserve(32); }
+        std::vector<DrawOp> Acquire()
+        {
+            {
+                std::lock_guard lock(mutex);
+                if (!spare.empty())
+                {
+                    auto batch = std::move(spare.back());
+                    spare.pop_back();
+                    return batch;
+                }
+            }
+            // Allocate outside the pool lock: the recorder can return another
+            // batch concurrently without being blocked by malloc.
+            std::vector<DrawOp> batch;
+            batch.reserve(kBufferedDraws);
+            return batch;
+        }
+        void Recycle(std::vector<DrawOp> batch)
+        {
+            batch.clear();
+            std::lock_guard lock(mutex);
+            if (spare.size() < 32) spare.push_back(std::move(batch));
+        }
+    };
+    DrawBatchPool g_drawBatchPool;
+    thread_local std::vector<DrawOp> pendingDraws;
+    void FlushDrawBatch()
+    {
+        if (pendingDraws.empty()) return;
+        std::vector<DrawOp> batch;
+        batch.swap(pendingDraws);
+        pendingDraws = g_drawBatchPool.Acquire();
+        // Deliberately bypass Record(): it calls FlushDrawBatch itself.
+        vk::record::Command([batch = std::move(batch)](VkCommandBuffer command) mutable {
+            for (size_t i = 0; i < batch.size();)
+            {
+                // Only draw operations with no intervening state changes
+                // can be combined. An indexed draw carries the kIndexed bit,
+                // even if the bound index buffer itself did not change.
+                const bool indexed = batch[i].set == DrawOp::kIndexed;
+                const bool plain = batch[i].set == 0;
+                const bool supported = indexed ? dispatch.drawMultiIndexed != nullptr
+                                               : dispatch.drawMulti != nullptr;
+                // Vulkan requires drawCount < maxMultiDrawCount for this EXT.
+                const size_t capacity = dispatch.maxMultiDrawCount > 2
+                    ? std::min(kBufferedDraws, size_t(dispatch.maxMultiDrawCount - 1)) : 0;
+                if ((indexed || plain) && supported && batch[i].count && capacity >= 2)
+                {
+                    size_t end = i + 1;
+                    while (end < batch.size() && end - i < capacity &&
+                           batch[end].set == batch[i].set && batch[end].count)
+                        ++end;
+                    if (end - i >= 2)
+                    {
+                        if (indexed)
+                        {
+                            // The producer bounds each batch at 64 draws:
+                            // avoid heap allocations on the recorder thread.
+                            std::array<VkMultiDrawIndexedInfoEXT, kBufferedDraws> infos{};
+                            for (size_t j = i; j < end; ++j)
+                                infos[j - i] = { batch[j].firstIndex, batch[j].count, 0 };
+                            dispatch.drawMultiIndexed(command, uint32_t(end - i), infos.data(),
+                                                       1, 0, sizeof(VkMultiDrawIndexedInfoEXT),
+                                                       nullptr);
+                        }
+                        else
+                        {
+                            std::array<VkMultiDrawInfoEXT, kBufferedDraws> infos{};
+                            for (size_t j = i; j < end; ++j)
+                                infos[j - i] = { 0, batch[j].count };
+                            dispatch.drawMulti(command, uint32_t(end - i), infos.data(),
+                                               1, 0, sizeof(VkMultiDrawInfoEXT));
+                        }
+                        i = end;
+                        continue;
+                    }
+                }
+                batch[i++](command);
+            }
+            // Executing this after the command loop ensures no draw operation
+            // references the vector while it is available to the producer.
+            g_drawBatchPool.Recycle(std::move(batch));
+        });
+    }
+
+    void QueueDraw(const DrawOp& op)
+    {
+        pendingDraws.push_back(op);
+        // A bounded batch avoids accumulating memory during a long sequence
+        // of draws with no intervening transfers or render-pass boundaries.
+        if (pendingDraws.size() >= kBufferedDraws) FlushDrawBatch();
+    }
 }
 
 using namespace vk::renderer::detail;
@@ -252,13 +381,8 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
     const VkPrimitiveTopology topology = TopologyFor(call.primitive);
     if (topology == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM) { Skip("primitive type"); return; }
 
-    gpu::detail::SetCurrentDrawStage("Draw_ShaderFor");
-    const Shader* vertex = ShaderFor(shader::Type::Vertex, call.vertexHash,
-                                     call.vertexCode, call.vertexWords);
-    const Shader* pixel = ShaderFor(shader::Type::Pixel, call.pixelHash,
-                                    call.pixelCode, call.pixelWords);
-    if (!vertex || !pixel) { Skip("shader not translated"); return; }
-
+    // Reject zero-area draws before translating shaders or creating pipelines.
+    // They cannot touch a target, regardless of their shader state.
     VkRect2D scissor{};
     ScissorOf(r, scissor);
     if (!scissor.extent.width || !scissor.extent.height) { Skip("empty scissor"); return; }
@@ -286,6 +410,23 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
         if (!BeginFrame()) { Skip("no command buffer"); return; }
         ClearAliasedDepth(depthInfo.BaseTile());
         Skip("EDRAM depth clear");
+        return;
+    }
+
+    // Purely clipped/empty geometry cannot write to the 2048x2048 EDRAM
+    // target. Check it before allocating images, reading indices or compiling
+    // shaders; preserve the special depth-clear packet handled above.
+    const int64_t right = int64_t(scissor.offset.x) + scissor.extent.width;
+    const int64_t bottom = int64_t(scissor.offset.y) + scissor.extent.height;
+    if (scissor.offset.x >= 2048 || scissor.offset.y >= 2048 ||
+        right <= 0 || bottom <= 0)
+    {
+        Skip("fully clipped from EDRAM");
+        return;
+    }
+    if (!call.indexCount || (call.indexed && !call.indexAddress))
+    {
+        Skip("no geometry");
         return;
     }
 
@@ -329,6 +470,22 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
     const uint32_t width = std::min(usePitch, 2048u);
     const uint32_t height = std::clamp(uint32_t(scissor.offset.y) + scissor.extent.height,
                                        32u, maxAllowedHeight);
+
+    // Compute target bounds before shader lookup. Pure EDRAM clear packets
+    // above require no translated shader; draws fully outside this surface
+    // should not compile shaders or allocate Vulkan render targets either.
+    if (scissor.offset.x >= int64_t(width) || scissor.offset.y >= int64_t(height))
+    {
+        Skip("scissor outside surface");
+        return;
+    }
+
+    gpu::detail::SetCurrentDrawStage("Draw_ShaderFor");
+    const Shader* vertex = ShaderFor(shader::Type::Vertex, call.vertexHash,
+                                     call.vertexCode, call.vertexWords);
+    const Shader* pixel = ShaderFor(shader::Type::Pixel, call.pixelHash,
+                                    call.pixelCode, call.pixelWords);
+    if (!vertex || !pixel) { Skip("shader not translated"); return; }
 
     gpu::detail::SetCurrentDrawStage("Draw_EnsureTarget");
     Target* colourTarget = EnsureTarget({ colour.BaseTile(), usePitch,
@@ -521,9 +678,22 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
                       uint32_t(colourTarget->format), uint32_t(depthTarget->format),
                       key.topology, depthControl, key.blendControl,
                       key.colourMask, modeCntl, key.samples };
-        EnqueuePipelineWarmup(rec, /*highPriority=*/true);
-        Skip("pipeline compiling asynchronously in background");
-        return;
+        // Correctness first: a missing pipeline must never silently discard
+        // geometry. The first use may stall, but the warmup worker and
+        // persistent cache reduce the number of such misses. An explicit
+        // diagnostic opt-out restores the old skip-on-miss behavior.
+        if (!env::Flag("MW2_ASYNC_PIPELINE_MISS"))
+        {
+            Stopwatch watch(g.pipelineNanoseconds);
+            built = EnsurePipeline(key, *vertex, *pixel, &newPipeline);
+            if (!built) { Skip("pipeline rejected after synchronous compile"); return; }
+        }
+        else
+        {
+            EnqueuePipelineWarmup(rec, /*highPriority=*/true);
+            Skip("pipeline compiling asynchronously in background");
+            return;
+        }
     }
 #else
     VkPipeline built = [&] { Stopwatch watch(g.pipelineNanoseconds);
@@ -532,32 +702,17 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
 #endif
     if (newPipeline && ShaderCachePath())
     {
+        // Record the recipe now, but never synchronously serialize every
+        // shader plus the driver's pipeline cache in the middle of a draw.
+        // FinishFrame checkpoints recipes during non-world frames; Shutdown
+        // persists any remaining entries even after continuous gameplay.
         g.recorded.push_back({ key.vertexShader, key.pixelShader,
                                uint32_t(colourTarget->format), uint32_t(depthTarget->format),
                                key.topology, depthControl, key.blendControl,
                                key.colourMask, modeCntl, key.samples });
-        static uint32_t s_lastSaved = 0;
-        if (g.recorded.size() - s_lastSaved >= 5)
-        {
-            s_lastSaved = uint32_t(g.recorded.size());
-            WriteShaderCache();
-        }
     }
 
-    // What each slot is declared as, so a texture of another kind is not bound
-    // there. The two stages share the set; where both sample a slot the pixel
-    // shader's reading wins, and the title has not been seen to disagree.
-    uint8_t kinds[vk::textures::kSlots];
-    for (uint32_t s = 0; s < vk::textures::kSlots; s++)
-        kinds[s] = (pixel->translation.textureMask & (1u << s))
-                       ? pixel->translation.textureKinds[s]
-                       : vertex->translation.textureKinds[s];
-    uint32_t scaledSlots = 0;
-    gpu::detail::SetCurrentDrawStage("Draw_TextureSetFor");
-    VkDescriptorSet textureSet = TextureSetFor(
-        r, vertex->translation.textureMask | pixel->translation.textureMask, kinds, scaledSlots);
-    if (!textureSet) { Skip("no texture descriptor set"); return; }
-
+    // Cull fully clipped draws before texture uploads and descriptor allocation.
     VkViewport viewport{};
     ViewportOf(r, scissor, viewport);
 
@@ -581,6 +736,30 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
     scissor.extent.height = std::min(scissor.extent.height,
                                      g.currentHeight - uint32_t(scissor.offset.y));
     if (!scissor.extent.width || !scissor.extent.height) { Skip("empty scissor"); return; }
+
+
+    // What each slot is declared as, so a texture of another kind is not bound
+    // there. The two stages share the set; where both sample a slot the pixel
+    // shader's reading wins, and the title has not been seen to disagree.
+    // Keep descriptor-key kinds at their 2D fallback for unused slots.
+    // Previously every draw copied 32 kinds even when its shaders only used
+    // one or two samplers, multiplying redundant descriptor-set variants.
+    uint8_t kinds[vk::textures::kSlots]{};
+    const uint32_t textureMask = vertex->translation.textureMask |
+                                 pixel->translation.textureMask;
+    uint32_t activeKinds = textureMask;
+    while (activeKinds)
+    {
+        const uint32_t s = std::countr_zero(activeKinds);
+        activeKinds &= activeKinds - 1;
+        kinds[s] = (pixel->translation.textureMask & (1u << s))
+                       ? pixel->translation.textureKinds[s]
+                       : vertex->translation.textureKinds[s];
+    }
+    uint32_t scaledSlots = 0;
+    gpu::detail::SetCurrentDrawStage("Draw_TextureSetFor");
+    VkDescriptorSet textureSet = TextureSetFor(r, textureMask, kinds, scaledSlots);
+    if (!textureSet) { Skip("no texture descriptor set"); return; }
 
     State::Bound& bound = g.bound;
     DrawOp op;
@@ -845,7 +1024,7 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
     }
     else op.count = call.indexCount;
     gpu::detail::SetCurrentDrawStage("Draw_Record");
-    Record(op);
+    QueueDraw(op);
     colourTarget->draws++;
     // The depth target too, so a dump can tell a depth buffer some pass is
     // testing against from one no pass has ever bound.

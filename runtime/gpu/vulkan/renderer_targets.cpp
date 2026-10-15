@@ -403,7 +403,11 @@ namespace vk::renderer::detail
         if (found != g.targets.end())
         {
             // The surface grew. Rare enough to rebuild rather than plan for.
-            RetireBeforeDestroy();
+            if (!RetireBeforeDestroy())
+            {
+                Skip("cannot retire old render target");
+                return nullptr;
+            }
             DestroyTarget(found->second);
             width = std::min(2048u, std::max(width, found->second.width));
             height = std::min(2048u, std::max(height, found->second.height));
@@ -440,7 +444,15 @@ namespace vk::renderer::detail
                        : (gpu::ColorTargetFormatName(guestFormat) ?: "unknown"),
              unsigned(target.samples), 1u << key.samples);
         Target& stored = g.targets.emplace(key, target).first->second;
-        ClearNewTarget(stored);
+        if (!ClearNewTarget(stored))
+        {
+            // A failed frame-slot transition must not leave a target whose
+            // undefined layout will later be treated as an initialised image.
+            DestroyTarget(stored);
+            g.targets.erase(key);
+            Skip("render target initialisation failed");
+            return nullptr;
+        }
         return &stored;
     }
 
@@ -727,60 +739,54 @@ namespace vk::renderer::detail
         }
     }
 
-    // One-shot, on the set-up command buffer: a new target leaves UNDEFINED
-    // and is cleared before any frame's render pass loads it.
-    void ClearNewTarget(Target& target)
+    // Initialise a new attachment in the renderer's next GPU submission,
+    // before the draw which consumes it. The former path submitted a separate
+    // command buffer for each new attachment and immediately waited on a
+    // fence, turning material/scene streaming into CPU/GPU stalls.
+    //
+    // A pass may already be open on an older attachment: close it before
+    // recording image-layout transitions. The command recorder and graphics
+    // queue preserve ordering with previous draws, uploads and future passes.
+    bool ClearNewTarget(Target& target)
     {
-        VkCommandBufferBeginInfo begin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VkCommandBuffer cmd = g.setup;
-        if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) return;
+        if (!BeginFrame()) return false;
+        EndPass();
 
-        const VkImageAspectFlags aspect = target.depth
-            ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+        const VkImage image = target.image;
+        const bool depth = target.depth;
+        const VkImageAspectFlags aspect = depth
+            ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
             : VK_IMAGE_ASPECT_COLOR_BIT;
-        Barrier(cmd, target.image, aspect, VK_IMAGE_LAYOUT_UNDEFINED,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-        VkImageSubresourceRange range{ aspect, 0, 1, 0, 1 };
-        if (target.depth)
-        {
-            // Zero, not one: a level tests GEQUAL, and RB_DEPTH_CLEAR is zero.
-            VkClearDepthStencilValue value{ 0.0f, 0 };
-            vkCmdClearDepthStencilImage(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                        &value, 1, &range);
-        }
-        else
-        {
-            // Not black: a target the title has not drawn into, and a frame that reached
-            // the screen without a draw, are then distinguishable from an empty resolve.
-            VkClearColorValue value{};
-            value.float32[0] = 0.06f; value.float32[1] = 0.07f;
-            value.float32[2] = 0.10f; value.float32[3] = 1.0f;
-            vkCmdClearColorImage(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                 &value, 1, &range);
-        }
-        Barrier(cmd, target.image, aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                target.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                             : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                VK_ACCESS_TRANSFER_WRITE_BIT,
-                target.depth ? kDepthAccess : kColourAccess,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, target.depth ? kDepthStages : kColourStages);
-        vkEndCommandBuffer(cmd);
+        const VkImageSubresourceRange range{ aspect, 0, 1, 0, 1 };
+        const VkClearDepthStencilValue depthValue{ 0.0f, 0 };
+        VkClearColorValue colourValue{};
+        colourValue.float32[0] = 0.06f;
+        colourValue.float32[1] = 0.07f;
+        colourValue.float32[2] = 0.10f;
+        colourValue.float32[3] = 1.0f;
 
-        VkSubmitInfo submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &cmd;
-        std::lock_guard lock(vk::pipeline::QueueMutex());
-        vkResetFences(g.device, 1, &g.setupFence);
-        vkQueueSubmit(g.queue, 1, &submit, g.setupFence);
-        VkResult res = vkWaitForFences(g.device, 1, &g.setupFence, VK_TRUE, 2000000000ull);
-        if (res == VK_TIMEOUT)
-        {
-            LOGW("renderer: waiting for the set-up fence took >2 seconds; continuing wait...");
-            res = vkWaitForFences(g.device, 1, &g.setupFence, VK_TRUE, UINT64_MAX);
-        }
-        vk::pipeline::Failed(res, "the set-up fence");
+        Record([=](VkCommandBuffer command) {
+            Barrier(command, image, aspect, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+            if (depth)
+                vkCmdClearDepthStencilImage(command, image,
+                                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            &depthValue, 1, &range);
+            else
+                vkCmdClearColorImage(command, image,
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                     &colourValue, 1, &range);
+            Barrier(command, image, aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                          : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                    depth ? kDepthAccess : kColourAccess,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    depth ? kDepthStages : kColourStages);
+        });
+        return true;
     }
 }
 

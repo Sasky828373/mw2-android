@@ -395,6 +395,9 @@ namespace vk::renderer::detail
             g.replacedPipelines.push_back(found->second);
             found->second = optimised;
             g.pipelinesOptimised++;
+            // A renderer thread may hold this key in its lock-free hot lookup.
+            // Invalidate only when a replacement actually reached the cache.
+            g_pipelineLookupVersion.fetch_add(1, std::memory_order_release);
         }
     }
 

@@ -13,6 +13,16 @@ endif()
 
 target_compile_definitions(mw2 PRIVATE MW2_ANDROID=1)
 
+# Keep the linked ARM64 runtime lean. Each generated guest function is
+# separately sectioned so lld can discard unreferenced code and data.
+# This does not change shader fidelity, render scale or frame pacing.
+option(MW2_ANDROID_LINK_GC "Discard unused Android native sections" ON)
+if(MW2_ANDROID_LINK_GC)
+    target_compile_options(mw2 PRIVATE -ffunction-sections -fdata-sections)
+    target_compile_options(ppc_recomp PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(mw2 PRIVATE -Wl,--gc-sections)
+endif()
+
 # 16 KB pages. Android 15 devices ship with them, and a library linked for 4 KB
 # will not load at all there. Nothing in the runtime assumes a page size --
 # everything asks sysconf -- so this is purely the linker's alignment.

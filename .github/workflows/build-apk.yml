@@ -16,13 +16,13 @@ on:
       upload_release:
         description: "Upload APK directly to GitHub Release"
         type: boolean
-        default: true
+        default: false
       release_tag:
         description: "GitHub Release tag to attach to"
         type: string
         default: "v0.0.1"
   push:
-    branches: [ master ]
+    branches: [ master, 'optimize/campaign-vulkan-120fps-20261014' ]
     paths:
       - 'android/**'
       - 'runtime/**'
@@ -39,6 +39,7 @@ permissions:
 
 env:
   NDK_VERSION: "28.2.13676358"
+  CCACHE_MAXSIZE: "750M"
 
 jobs:
   build:
@@ -68,6 +69,14 @@ jobs:
             rm -rf /tmp/simde-repo
           fi
 
+      - name: Restore C++ compilation cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: mw2-arm64-ccache-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ hashFiles('CMakeLists.txt', 'android/app/build.gradle.kts') }}
+          restore-keys: |
+            mw2-arm64-ccache-${{ runner.os }}-${{ env.NDK_VERSION }}-
+
       - name: Install Android NDK & CMake
         run: |
           sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
@@ -89,6 +98,7 @@ jobs:
         working-directory: android
         env:
           MW2_NDK_VERSION: ${{ env.NDK_VERSION }}
+          MW2_COMPILER_LAUNCHER: ccache
           MW2_BUILD_SHA: ${{ github.sha }}
           MW2_XEX_SHA256_SP: "990e640d3a92544f9d585e71faf1ab65082d37ec6f5865b2599335fa123bf6ff"
           MW2_XEX_SHA256_MP: "aacc47aff3221f3bd9129e80827fd3bcd74aa43bf74bb5c5ddbd0597c0d5fcde"
@@ -118,7 +128,9 @@ jobs:
           retention-days: 30
 
       - name: Upload to GitHub Release
-        if: github.event_name == 'release' || github.event.inputs.upload_release == true || github.event.inputs.upload_release == 'true' || github.event_name == 'push'
+        # Never overwrite a published APK on every optimization push.
+        # Push builds are still available as verified Actions artifacts.
+        if: github.event_name == 'release' || github.event.inputs.upload_release == true || github.event.inputs.upload_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

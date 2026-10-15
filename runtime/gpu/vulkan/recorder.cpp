@@ -43,8 +43,13 @@ namespace
 
     // A frame queues about 2 MB; this is several frames.
     constexpr uint64_t kBytes = 16u << 20;
-    // Pauses before a side sleeps: tens of microseconds.
+    // Android ARM64: a shorter spin window avoids burning a fast CPU core
+    // while the GPU/producer is idle. Atomic wait/notify provides wakeups.
+#if defined(__ANDROID__)
+    constexpr uint32_t kSpins = 256;
+#else
     constexpr uint32_t kSpins = 4000;
+#endif
 
     // Each side's own fields on lines of their own, so neither side's writes
     // take the other's cache line away from it on every call.
@@ -96,14 +101,32 @@ namespace
                 q.recorderAsleep.store(false, std::memory_order_relaxed);
                 continue;
             }
+            // Publish completion in batches instead of paying for a seq_cst
+            // atomic store on every Vulkan command. Keep waiter latency low:
+            // a waiting producer/fence can still observe progress promptly.
+            uint32_t completedInBatch = 0;
             while (at != end)
             {
                 Header* header = reinterpret_cast<Header*>(ring + (at & (kBytes - 1)));
                 if (header->run) header->run(header + 1, header->command);
                 at += header->bytes;
                 calls++;
-                q.made.store(at, std::memory_order_seq_cst);
-                if (q.waiters.load(std::memory_order_seq_cst)) q.made.notify_all();
+                ++completedInBatch;
+                // The recorder can issue millions of small Vulkan commands per
+                // second. Sampling the producer/waiter cache line on *every*
+                // command causes avoidable inter-core traffic on ARM64.
+                // Check waiters every 8 calls, publish at 32 or at the end;
+                // a blocked producer is then woken within at most 8 calls.
+                if ((completedInBatch & 7u) == 0 || at == end)
+                {
+                    const bool waiting = q.waiters.load(std::memory_order_acquire) != 0;
+                    if (waiting || completedInBatch >= 32 || at == end)
+                    {
+                        q.made.store(at, std::memory_order_release);
+                        if (waiting) q.made.notify_all();
+                        completedInBatch = 0;
+                    }
+                }
             }
         }
         q.calls.store(calls, std::memory_order_relaxed);

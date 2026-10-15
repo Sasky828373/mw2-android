@@ -559,7 +559,19 @@ namespace
         while (Running())
         {
             DeliverOcclusionQueries();
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            // A genuine GPU/guest handshake can be cleared within a few
+            // microseconds; keep that latency for short waits. Long waits
+            // used to wake the command-processor thread 20,000 times/second
+            // (50 us sleeps), wasting CPU and battery while the guest could
+            // not proceed. Back off only after the request is demonstrably
+            // slow, without reducing render fidelity or altering its timeout.
+            const auto elapsed = waited();
+            const auto pause = elapsed < std::chrono::milliseconds(2)
+                ? std::chrono::microseconds(50)
+                : elapsed < std::chrono::milliseconds(20)
+                    ? std::chrono::microseconds(150)
+                    : std::chrono::microseconds(500);
+            std::this_thread::sleep_for(pause);
             if (matches(current())) { matched = true; break; }
             if (waited() > kTimeout) break;
         }
@@ -978,7 +990,12 @@ namespace
                                    : (type == 2) ? 0
                                    : ((header >> 16) & 0x3FFF) + 1;
             const uint32_t opcode = (type == 3) ? ((header >> 8) & 0x7F) : 0xFF;
-            RecordPacket(packetAddr, header, type, opcode, payload, s.remaining, depth);
+            // The 64-entry PM4 history exists for debug desync diagnostics.
+            // Updating it on every packet in an Android Release build needlessly
+            // writes multiple cache lines in the command processor's hot loop.
+            // Keep it verbatim in diagnostic builds.
+            if constexpr (diag::kOn)
+                RecordPacket(packetAddr, header, type, opcode, payload, s.remaining, depth);
             g_currentOpcode.store((type << 8) | (type == 3 ? opcode : 0), std::memory_order_relaxed);
             g_currentOpcodeName.store(type == 3 ? OpcodeName(opcode) : (type == 0 ? "TYPE_0" : type == 1 ? "TYPE_1" : "TYPE_2"), std::memory_order_relaxed);
             g_currentDepth.store(depth, std::memory_order_relaxed);
@@ -990,7 +1007,7 @@ namespace
                 {
                     LOGW("pm4: packet at %08X (header %08X, type %u, payload %u words, remaining %u words, depth %d) invalid; seeking next valid packet",
                          packetAddr, header, type, payload, s.remaining, depth);
-                    DumpPacketHistory(16);
+                    if constexpr (diag::kOn) DumpPacketHistory(16);
                     DumpMemoryWindow(packetAddr);
                 }
 

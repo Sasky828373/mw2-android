@@ -110,10 +110,21 @@ namespace
         t_guestPcr = g.gpuPcr;
         LOGI("gpu: ring consumer started");
         g.consumerStarted = std::chrono::steady_clock::now();
+        auto lastPacket = g.consumerStarted;
+        auto nextQueryPoll = g.consumerStarted;
 
         while (g.running.load(std::memory_order_relaxed))
         {
-            DeliverOcclusionQueries();
+            // Query completion is asynchronous, but polling it every 100 us
+            // when the title is idle creates thousands of redundant driver
+            // calls per second. Poll at most once per 250 us while idle;
+            // active command batches still service the queries immediately.
+            const auto loopAt = std::chrono::steady_clock::now();
+            if (loopAt >= nextQueryPoll)
+            {
+                DeliverOcclusionQueries();
+                nextQueryPoll = loopAt + std::chrono::microseconds(250);
+            }
             if (!g.ring.dwords)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -123,6 +134,9 @@ namespace
             const uint32_t wptr = *GuestPtr<be32>(kCpRbWptr) & g.ring.mask;
             if (wptr != g.ring.readIndex)
             {
+                lastPacket = std::chrono::steady_clock::now();
+                DeliverOcclusionQueries();
+                nextQueryPoll = lastPacket + std::chrono::microseconds(250);
                 const uint32_t available = (wptr - g.ring.readIndex) & g.ring.mask;
                 std::chrono::steady_clock::time_point began;
                 if constexpr (diag::kOn) began = std::chrono::steady_clock::now();
@@ -159,7 +173,17 @@ namespace
                 if (g.rptrWriteBack) *GuestPtr<be32>(g.rptrWriteBack) = g.ring.readIndex;
                 continue;
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            // Adaptive idle backoff: keep sub-frame wake latency while the
+            // game actively submits commands, but let the CPU stay asleep
+            // between levels, in menus and when the app is backgrounded.
+            // The hot-path ceiling is 200 us (2.4% of an 8.33 ms frame).
+            const auto idleFor = std::chrono::steady_clock::now() - lastPacket;
+            const auto pause = idleFor < std::chrono::milliseconds(2)
+                ? std::chrono::microseconds(75)
+                : idleFor < std::chrono::milliseconds(50)
+                    ? std::chrono::microseconds(200)
+                    : std::chrono::microseconds(750);
+            std::this_thread::sleep_for(pause);
         }
         g.consumerStopped = std::chrono::steady_clock::now();
         LOGI("gpu: ring consumer stopped");

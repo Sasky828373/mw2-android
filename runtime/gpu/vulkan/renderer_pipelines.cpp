@@ -8,11 +8,13 @@
 #include "../../report.h"
 #include "pipeline.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_set>
 #ifdef MW2_ANDROID
@@ -24,9 +26,29 @@
 namespace vk::renderer::detail
 {
     std::mutex g_pipelinesMutex;
+    // Bumped whenever a linked pipeline is replaced or the renderer is
+    // destroyed. Per-thread hot lookups can otherwise retain obsolete handles.
+    std::atomic<uint64_t> g_pipelineLookupVersion{ 1 };
     namespace
     {
         std::mutex g_shadersMutex;
+        // The command processor repeatedly uses the same shader pair for a
+        // group of draws. Avoid two std::map searches and two mutex acquisitions
+        // on every draw. std::map node addresses stay stable as new shaders
+        // arrive; lifecycle generation prevents stale pointers after restart.
+        std::atomic<uint64_t> g_shaderLookupGeneration{ 1 };
+        struct HotShader
+        {
+            uint64_t generation = 0;
+            uint64_t hash = 0;
+            const Shader* shader = nullptr;
+        };
+        thread_local HotShader t_hotShaders[2];
+    }
+
+    void InvalidateShaderLookupCache()
+    {
+        g_shaderLookupGeneration.fetch_add(1, std::memory_order_relaxed);
     }
 
     // A shader the title has not drawn with before here: taken from the ones
@@ -35,11 +57,18 @@ namespace vk::renderer::detail
     const Shader* ShaderFor(shader::Type type, uint64_t hash, const uint32_t* code, size_t words)
     {
         if (!code || !words) return nullptr;
+        const uint64_t generation = g_shaderLookupGeneration.load(std::memory_order_relaxed);
+        HotShader& hot = t_hotShaders[type == shader::Type::Pixel ? 1 : 0];
+        if (hot.generation == generation && hot.hash == hash)
+            return hot.shader;
         {
             std::lock_guard lock(g_shadersMutex);
             auto found = g.shaders.find(hash);
             if (found != g.shaders.end())
-                return found->second.module ? &found->second : nullptr;
+            {
+                hot = { generation, hash, found->second.module ? &found->second : nullptr };
+                return hot.shader;
+            }
         }
 
         Shader entry;
@@ -63,7 +92,8 @@ namespace vk::renderer::detail
                                       : entry.translation.error.c_str());
         std::lock_guard lock(g_shadersMutex);
         auto& stored = g.shaders.emplace(hash, std::move(entry)).first->second;
-        return ok ? &stored : nullptr;
+        hot = { generation, hash, ok ? &stored : nullptr };
+        return hot.shader;
     }
 
     VkCompareOp CompareOp(uint32_t function)
@@ -366,21 +396,50 @@ namespace vk::renderer::detail
 
     VkPipeline FindPipeline(const PipelineKey& key)
     {
+        // The background optimisation worker can replace a fast pipeline;
+        // TakeOptimisedPipelines publishes any new handles and increments the
+        // cache version before a cached handle may be returned.
         TakeOptimisedPipelines();
+        struct HotPipeline
+        {
+            PipelineKey key{};
+            VkPipeline handle = VK_NULL_HANDLE;
+            uint64_t version = 0;
+        };
+        constexpr uint32_t kHotEntries = 4;
+        static thread_local HotPipeline hot[kHotEntries];
+        static thread_local uint32_t replaceAt = 0;
+        const uint64_t version = g_pipelineLookupVersion.load(std::memory_order_acquire);
+        for (const HotPipeline& entry : hot)
+            if (entry.version == version && entry.handle && entry.key == key)
+                return entry.handle;
+
         std::lock_guard lock(g_pipelinesMutex);
         auto found = g.pipelines.find(key);
-        if (found != g.pipelines.end()) return found->second;
-        return VK_NULL_HANDLE;
+        if (found == g.pipelines.end()) return VK_NULL_HANDLE;
+        // Retain several recently used pipelines: the game often alternates
+        // between materials and UI passes, and a one-entry cache would thrash.
+        hot[(replaceAt++) % kHotEntries] = { key, found->second, version };
+        return found->second;
     }
 
     VkPipeline EnsurePipeline(const PipelineKey& key, const Shader& vertex, const Shader& pixel,
                               bool* made)
     {
         TakeOptimisedPipelines();
+        // Serialize cache misses between the warmup worker and the gameplay
+        // thread. Without this, both can compile the same pipeline, overwrite
+        // the cached handle and leak GPU/driver objects under heavy misses.
+        static std::mutex compileMutex;
+        std::lock_guard compileLock(compileMutex);
         {
             std::lock_guard lock(g_pipelinesMutex);
             auto found = g.pipelines.find(key);
-            if (found != g.pipelines.end()) return found->second;
+            if (found != g.pipelines.end())
+            {
+                if (made) *made = false;
+                return found->second;
+            }
         }
 
         if (made) *made = true;
@@ -417,11 +476,13 @@ namespace vk::renderer::detail
         struct QueueItem
         {
             Recorded recorded;
+            bool highPriority = false;
         };
 
         std::mutex g_warmupMutex;
         std::condition_variable g_warmupCv;
         std::deque<QueueItem> g_warmupQueue;
+        std::optional<Recorded> g_inFlight;
         std::thread g_warmupThread;
         std::atomic<bool> g_warmupRunning{ false };
         std::atomic<bool> g_warmupStopping{ false };
@@ -482,7 +543,17 @@ namespace vk::renderer::detail
 
                     item = g_warmupQueue.front();
                     g_warmupQueue.pop_front();
+                    g_inFlight = item.recorded;
                 }
+
+                struct ReleaseInFlight
+                {
+                    ~ReleaseInFlight()
+                    {
+                        std::lock_guard lock(g_warmupMutex);
+                        g_inFlight.reset();
+                    }
+                } releaseInFlight;
 
                 PipelineKey key;
                 key.vertexShader = item.recorded.vertexShader;
@@ -540,7 +611,11 @@ namespace vk::renderer::detail
                          tookMs, c, g_statQueued.load(std::memory_order_relaxed));
 
                     static uint32_t s_lastSave = 0;
-                    if (c - s_lastSave >= 5)
+                    // Pipeline-cache serialization can contend with the
+                    // gameplay compiler and perform synchronous disk writes.
+                    // Batch updates and leave persistence to idle moments
+                    // (shutdown also saves the cache).
+                    if (c - s_lastSave >= 32 && !RenderActive())
                     {
                         s_lastSave = c;
                         vk::pipeline::SaveCache();
@@ -578,7 +653,15 @@ namespace vk::renderer::detail
                 {
                     sleepMs = 35;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+                // Low-priority warmup must yield to gameplay pipeline misses.
+                // Wake promptly for newly queued urgent work or shutdown.
+                {
+                    std::unique_lock lock(g_warmupMutex);
+                    g_warmupCv.wait_for(lock, std::chrono::milliseconds(sleepMs), [&] {
+                        return g_warmupStopping.load(std::memory_order_relaxed) ||
+                               (!g_warmupQueue.empty() && g_warmupQueue.front().highPriority);
+                    });
+                }
                 if (sleepMs >= 200)
                     LOGI("warmup: render-active backpressure -- slept %d ms after %u ms compile",
                          sleepMs, tookMs);
@@ -600,8 +683,21 @@ namespace vk::renderer::detail
     {
         {
             std::lock_guard lock(warmup::g_warmupMutex);
-            for (const auto& item : warmup::g_warmupQueue)
+            // A currently compiling item is no longer in the deque.
+            // Avoid duplicate submissions while the worker is processing it.
+            if (warmup::g_inFlight)
             {
+                const Recorded& in = *warmup::g_inFlight;
+                if (in.vertexShader == rec.vertexShader && in.pixelShader == rec.pixelShader &&
+                    in.colourFormat == rec.colourFormat && in.depthFormat == rec.depthFormat &&
+                    in.topology == rec.topology && in.blendControl == rec.blendControl &&
+                    in.colourMask == rec.colourMask && in.modeCntl == rec.modeCntl &&
+                    in.depthControl == rec.depthControl && in.samples == rec.samples)
+                    return;
+            }
+            for (auto it = warmup::g_warmupQueue.begin(); it != warmup::g_warmupQueue.end(); ++it)
+            {
+                const auto& item = *it;
                 if (item.recorded.vertexShader == rec.vertexShader &&
                     item.recorded.pixelShader == rec.pixelShader &&
                     item.recorded.colourFormat == rec.colourFormat &&
@@ -610,15 +706,26 @@ namespace vk::renderer::detail
                     item.recorded.blendControl == rec.blendControl &&
                     item.recorded.colourMask == rec.colourMask &&
                     item.recorded.modeCntl == rec.modeCntl &&
-                    item.recorded.depthControl == rec.depthControl)
+                    item.recorded.depthControl == rec.depthControl &&
+                    item.recorded.samples == rec.samples)
                 {
+                    // A cache prewarm that becomes visible during gameplay
+                    // should not sit behind hundreds of background pipelines.
+                    if (highPriority && !it->highPriority)
+                    {
+                        auto promoted = *it;
+                        promoted.highPriority = true;
+                        warmup::g_warmupQueue.erase(it);
+                        warmup::g_warmupQueue.push_front(promoted);
+                        warmup::g_warmupCv.notify_one();
+                    }
                     return;
                 }
             }
             if (highPriority)
-                warmup::g_warmupQueue.push_front({ rec });
+                warmup::g_warmupQueue.push_front({ rec, true });
             else
-                warmup::g_warmupQueue.push_back({ rec });
+                warmup::g_warmupQueue.push_back({ rec, false });
             warmup::g_statQueued.fetch_add(1, std::memory_order_relaxed);
         }
         StartWarmupScheduler();

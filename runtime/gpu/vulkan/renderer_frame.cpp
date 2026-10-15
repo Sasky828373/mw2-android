@@ -22,15 +22,36 @@ namespace vk::renderer::detail
     // buffer is finished and waited for first, and a fresh one is begun if the
     // caller was in the middle of recording. Commands the recorder thread has
     // not made yet name it too, so it is waited for as well.
-    void RetireBeforeDestroy()
+    bool RetireBeforeDestroy()
     {
         const bool wasRecording = g.recording;
-        if (wasRecording) Submit(true);
+        if (wasRecording && !Submit(true))
+        {
+            // Do not retire or destroy resources when the GPU has not
+            // confirmed completion of the command buffer referencing them.
+            LOGE("renderer: cannot retire resources after failed frame submission");
+            return false;
+        }
         vk::record::Drain();
-        // The queue is in order, so nothing is outstanding afterwards.
-        vkDeviceWaitIdle(g.device);
-        for (State::Slot& slot : g.slots) slot.inFlight = false;
-        if (wasRecording) BeginFrame();
+        // Retire the renderer's known submissions using their per-slot fences.
+        // Avoid a device-wide stall in the normal destruction path; presenter
+        // work on the shared queue is independent of these resources.
+        bool retired = true;
+        for (State::Slot& slot : g.slots)
+            if (slot.inFlight && !WaitForSlot(slot, "a resource retirement fence"))
+                retired = false;
+        if (!retired)
+        {
+            // A failed/timed-out fence must not let us destroy live resources.
+            // Only this exceptional recovery path waits for the whole device.
+            if (vk::pipeline::Failed(vkDeviceWaitIdle(g.device),
+                                     "device idle after a retirement fence failure"))
+                return false;
+            for (State::Slot& slot : g.slots) slot.inFlight = false;
+        }
+        // Report failure to the caller: it must not free still-live images.
+        if (wasRecording && !BeginFrame()) return false;
+        return true;
     }
 
     bool BeginFrame()
@@ -226,8 +247,16 @@ namespace vk::renderer::detail
         if (!wait) return true;
 
         if (!WaitForSlot(slot, "a frame slot's fence")) return false;
-        // One queue, submitted in order: this one being done says all of them are.
-        for (State::Slot& other : g.slots) other.inFlight = false;
+        // Do not clear another slot merely because the queue is ordered:
+        // recorder submissions can still be pending, and each slot owns a
+        // separate command pool and arena region. Retire only confirmed work.
+        for (State::Slot& other : g.slots)
+        {
+            if (&other == &slot || !other.inFlight) continue;
+            if (vk::record::Done(other.queuedAt) &&
+                vkGetFenceStatus(g.device, other.fence) == VK_SUCCESS)
+                other.inFlight = false;
+        }
         return true;
     }
 
@@ -237,7 +266,11 @@ namespace vk::renderer::detail
         Stopwatch waited(g.fenceNanoseconds);
         stutters::Timed timed(stutters::kGpuWaits);
         vk::record::WaitFor(slot.queuedAt);
-        VkResult res = vkWaitForFences(g.device, 1, &slot.fence, VK_TRUE, 2000000000ull);
+        // Most slots have completed by the time we recycle them. Query first
+        // to avoid a blocking driver wait on the normal fast path.
+        VkResult res = vkGetFenceStatus(g.device, slot.fence);
+        if (res == VK_NOT_READY)
+            res = vkWaitForFences(g.device, 1, &slot.fence, VK_TRUE, 2000000000ull);
         if (res == VK_TIMEOUT)
         {
             LOGW("renderer: waiting for %s took >2 seconds; waiting up to 5s...", what);
@@ -245,8 +278,9 @@ namespace vk::renderer::detail
         }
         if (res == VK_TIMEOUT)
         {
-            LOGE("renderer: fence wait timed out for %s; aborting wait to avoid permanent hang", what);
-            slot.inFlight = false;
+            LOGE("renderer: fence wait timed out for %s; keeping slot in-flight to avoid reusing live GPU resources", what);
+            // A timed-out fence has NOT signalled. Never mark this slot free:
+            // its command pool and arena allocations can still be used by GPU.
             return false;
         }
         if (vk::pipeline::Failed(res, what))
@@ -307,6 +341,27 @@ namespace vk::renderer::detail
         report::Frame(worldDrawn);
         NoteFrame(worldDrawn);
         SetCutsceneActive(!worldDrawn);
+        // Most gameplay alternates world frames with UI-only frames; saving
+        // the entire shader cache on those interleaved frames still stalls
+        // gameplay. Checkpoint only after the world has been absent for at
+        // least 250 ms (menu/loading screen), no more than once per 5 s.
+        // Shutdown always persists any new recipes from uninterrupted play.
+        static auto lastWorldDrawAt = std::chrono::steady_clock::time_point{};
+        static auto lastSavedAt = std::chrono::steady_clock::time_point{};
+        static size_t lastSavedRecipes = 0;
+        const auto cacheNow = std::chrono::steady_clock::now();
+        if (worldDrawn) lastWorldDrawAt = cacheNow;
+        if (!worldDrawn && ShaderCachePath() &&
+            g.recorded.size() >= lastSavedRecipes + 32 &&
+            (lastWorldDrawAt == std::chrono::steady_clock::time_point{} ||
+             cacheNow - lastWorldDrawAt >= std::chrono::milliseconds(250)) &&
+            (lastSavedAt == std::chrono::steady_clock::time_point{} ||
+             cacheNow - lastSavedAt >= std::chrono::seconds(5)))
+        {
+            WriteShaderCache();
+            lastSavedRecipes = g.recorded.size();
+            lastSavedAt = cacheNow;
+        }
         if (worldDrawn)
         {
             const auto now = std::chrono::steady_clock::now();

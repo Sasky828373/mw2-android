@@ -63,7 +63,7 @@ namespace vk::renderer::detail
         // Rare -- a resolve destination that has to grow -- and both a submitted
         // slot and the buffer being recorded may still name the image being
         // replaced.
-        if (into.image) RetireBeforeDestroy();
+        if (into.image && !RetireBeforeDestroy()) return false;
         // The texture cache has built sets on these views. Its own check -- the
         // view behind an id changed -- misses a replacement that gets the old
         // handle back, and a set on the freed image is a texture read of unbacked
@@ -329,18 +329,21 @@ void vk::renderer::Resolve(const gpu::RegisterFile& r)
                   VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                   0, VK_ACCESS_TRANSFER_WRITE_BIT, kShaderStages, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    VkImageBlit copy{};
+    // EDRAM colour resolves transfer exactly the same pixel rectangle with
+    // the same format and dimensions: no scaling or colour-space conversion
+    // happens here. A filtered blit previously invoked the GPU's image
+    // sampling/blit path for every shadow, reflection and post-process resolve.
+    // A direct transfer copy preserves every bit and avoids filtering work.
+    VkImageCopy copy{};
     copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    copy.srcOffsets[0] = Scaled(int32_t(destX), int32_t(destY), 0);
-    copy.srcOffsets[1] = Scaled(int32_t(destX + width), int32_t(destY + height), 1);
+    copy.srcOffset = Scaled(int32_t(destX), int32_t(destY), 0);
     copy.dstSubresource = copy.srcSubresource;
-    copy.dstOffsets[0] = copy.srcOffsets[0];
-    copy.dstOffsets[1] = copy.srcOffsets[1];
+    copy.dstOffset = copy.srcOffset;
+    copy.extent = { width * g.scale, height * g.scale, 1 };
     const VkImage intoImage = into.image;
     Record([=](VkCommandBuffer command) {
-        vkCmdBlitImage(command, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       intoImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy,
-                       VK_FILTER_LINEAR);
+        vkCmdCopyImage(command, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       intoImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     });
 
     RecordBarrier(into.image, VK_IMAGE_ASPECT_COLOR_BIT,
@@ -391,10 +394,30 @@ void vk::renderer::Swap(uint32_t frontBuffer)
     blit.dstSubresource = blit.srcSubresource;
     blit.dstOffsets[1] = { int32_t(g.presentWidth), int32_t(g.presentHeight), 1 };
     const VkImage frameImage = frame.image;
-    Record([=](VkCommandBuffer command) {
-        vkCmdBlitImage(command, frameImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       present, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
-    });
+    // A native-resolution RGBA resolve needs neither filtering nor colour
+    // conversion. Prefer a transfer copy to a filtering blit on this hot path.
+    // Retain the exact original blit for different formats or dimensions.
+    const bool nativeCopy = frame.format == VK_FORMAT_R8G8B8A8_UNORM &&
+                            uint64_t(frame.width) * g.scale == g.presentWidth &&
+                            uint64_t(frame.height) * g.scale == g.presentHeight;
+    if (nativeCopy)
+    {
+        VkImageCopy copy{};
+        copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        copy.dstSubresource = copy.srcSubresource;
+        copy.extent = { g.presentWidth, g.presentHeight, 1 };
+        Record([=](VkCommandBuffer command) {
+            vkCmdCopyImage(command, frameImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           present, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        });
+    }
+    else
+    {
+        Record([=](VkCommandBuffer command) {
+            vkCmdBlitImage(command, frameImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           present, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        });
+    }
     RecordBarrier(frame.image, VK_IMAGE_ASPECT_COLOR_BIT,
                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                   VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,

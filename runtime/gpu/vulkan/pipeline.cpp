@@ -276,6 +276,9 @@ bool vk::pipeline::CreateDevice(void* physicalDevice, uint32_t family,
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT };
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT libraries{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT };
+    VkPhysicalDeviceMultiDrawFeaturesEXT multiDraw{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT };
+    const bool multiDrawExtension = DeviceHasExtension(physical, VK_EXT_MULTI_DRAW_EXTENSION_NAME);
 
     {
         VkPhysicalDeviceFeatures2 query{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
@@ -294,6 +297,11 @@ bool vk::pipeline::CreateDevice(void* physicalDevice, uint32_t family,
         {
             *tail = &libraries;
             tail = &libraries.pNext;
+        }
+        if (multiDrawExtension)
+        {
+            *tail = &multiDraw;
+            tail = &multiDraw.pNext;
         }
         if (query.pNext)
         {
@@ -327,6 +335,8 @@ bool vk::pipeline::CreateDevice(void* physicalDevice, uint32_t family,
              forceLegacy ? " (forced by MW2_FORCE_LEGACY_RENDERING)" : "");
     }
 
+    if (multiDrawExtension && multiDraw.multiDraw)
+        extensions.push_back(VK_EXT_MULTI_DRAW_EXTENSION_NAME);
     if (dynamicRenderingExtension) extensions.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
     if (dynamicStateExtension) extensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
     g.pipelineLibraries =
@@ -348,6 +358,11 @@ bool vk::pipeline::CreateDevice(void* physicalDevice, uint32_t family,
     else libraries.graphicsPipelineLibrary = VK_FALSE;
 
     void* chain = features;
+    if (multiDrawExtension && multiDraw.multiDraw)
+    {
+        multiDraw.pNext = chain;
+        chain = &multiDraw;
+    }
     if (g.pipelineLibraries)
     {
         libraries.pNext = chain;
