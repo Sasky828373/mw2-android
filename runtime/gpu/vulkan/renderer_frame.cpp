@@ -341,24 +341,26 @@ namespace vk::renderer::detail
         report::Frame(worldDrawn);
         NoteFrame(worldDrawn);
         SetCutsceneActive(!worldDrawn);
-        // The shader recipe and driver cache were previously serialized from
-        // Draw() after every few misses, stalling a world frame on disk IO
-        // and VkPipelineCache serialization. Persist only on non-world frames
-        // and at most once per five seconds; Shutdown always writes the rest.
-        // No extra thread touches the renderer's shader map during this call.
-        if (!worldDrawn && ShaderCachePath() && !g.recorded.empty())
+        // Most gameplay alternates world frames with UI-only frames; saving
+        // the entire shader cache on those interleaved frames still stalls
+        // gameplay. Checkpoint only after the world has been absent for at
+        // least 250 ms (menu/loading screen), no more than once per 5 s.
+        // Shutdown always persists any new recipes from uninterrupted play.
+        static auto lastWorldDrawAt = std::chrono::steady_clock::time_point{};
+        static auto lastSavedAt = std::chrono::steady_clock::time_point{};
+        static size_t lastSavedRecipes = 0;
+        const auto cacheNow = std::chrono::steady_clock::now();
+        if (worldDrawn) lastWorldDrawAt = cacheNow;
+        if (!worldDrawn && ShaderCachePath() &&
+            g.recorded.size() >= lastSavedRecipes + 32 &&
+            (lastWorldDrawAt == std::chrono::steady_clock::time_point{} ||
+             cacheNow - lastWorldDrawAt >= std::chrono::milliseconds(250)) &&
+            (lastSavedAt == std::chrono::steady_clock::time_point{} ||
+             cacheNow - lastSavedAt >= std::chrono::seconds(5)))
         {
-            static size_t lastSavedRecipes = 0;
-            static auto lastSavedAt = std::chrono::steady_clock::time_point{};
-            const auto now = std::chrono::steady_clock::now();
-            if (g.recorded.size() >= lastSavedRecipes + 32 &&
-                (lastSavedAt == std::chrono::steady_clock::time_point{} ||
-                 now - lastSavedAt >= std::chrono::seconds(5)))
-            {
-                WriteShaderCache();
-                lastSavedRecipes = g.recorded.size();
-                lastSavedAt = now;
-            }
+            WriteShaderCache();
+            lastSavedRecipes = g.recorded.size();
+            lastSavedAt = cacheNow;
         }
         if (worldDrawn)
         {
