@@ -26,6 +26,9 @@
 namespace vk::renderer::detail
 {
     std::mutex g_pipelinesMutex;
+    // Bumped whenever a linked pipeline is replaced or the renderer is
+    // destroyed. Per-thread hot lookups can otherwise retain obsolete handles.
+    std::atomic<uint64_t> g_pipelineLookupVersion{ 1 };
     namespace
     {
         std::mutex g_shadersMutex;
@@ -393,11 +396,31 @@ namespace vk::renderer::detail
 
     VkPipeline FindPipeline(const PipelineKey& key)
     {
+        // The background optimisation worker can replace a fast pipeline;
+        // TakeOptimisedPipelines publishes any new handles and increments the
+        // cache version before a cached handle may be returned.
         TakeOptimisedPipelines();
+        struct HotPipeline
+        {
+            PipelineKey key{};
+            VkPipeline handle = VK_NULL_HANDLE;
+            uint64_t version = 0;
+        };
+        constexpr uint32_t kHotEntries = 4;
+        static thread_local HotPipeline hot[kHotEntries];
+        static thread_local uint32_t replaceAt = 0;
+        const uint64_t version = g_pipelineLookupVersion.load(std::memory_order_acquire);
+        for (const HotPipeline& entry : hot)
+            if (entry.version == version && entry.handle && entry.key == key)
+                return entry.handle;
+
         std::lock_guard lock(g_pipelinesMutex);
         auto found = g.pipelines.find(key);
-        if (found != g.pipelines.end()) return found->second;
-        return VK_NULL_HANDLE;
+        if (found == g.pipelines.end()) return VK_NULL_HANDLE;
+        // Retain several recently used pipelines: the game often alternates
+        // between materials and UI passes, and a one-entry cache would thrash.
+        hot[(replaceAt++) % kHotEntries] = { key, found->second, version };
+        return found->second;
     }
 
     VkPipeline EnsurePipeline(const PipelineKey& key, const Shader& vertex, const Shader& pixel,

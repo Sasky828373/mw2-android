@@ -699,6 +699,7 @@ namespace vk::renderer::detail
     // Every finished frame, so the compiling waits while the world is drawn.
     void NoteFrame(bool world);
     extern std::mutex g_pipelinesMutex;
+    extern std::atomic<uint64_t> g_pipelineLookupVersion;
     void StartPreparing();
     void StopPreparing();
     void ReportPreparing();
