@@ -329,18 +329,21 @@ void vk::renderer::Resolve(const gpu::RegisterFile& r)
                   VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                   0, VK_ACCESS_TRANSFER_WRITE_BIT, kShaderStages, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-    VkImageBlit copy{};
+    // EDRAM colour resolves transfer exactly the same pixel rectangle with
+    // the same format and dimensions: no scaling or colour-space conversion
+    // happens here. A filtered blit previously invoked the GPU's image
+    // sampling/blit path for every shadow, reflection and post-process resolve.
+    // A direct transfer copy preserves every bit and avoids filtering work.
+    VkImageCopy copy{};
     copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    copy.srcOffsets[0] = Scaled(int32_t(destX), int32_t(destY), 0);
-    copy.srcOffsets[1] = Scaled(int32_t(destX + width), int32_t(destY + height), 1);
+    copy.srcOffset = Scaled(int32_t(destX), int32_t(destY), 0);
     copy.dstSubresource = copy.srcSubresource;
-    copy.dstOffsets[0] = copy.srcOffsets[0];
-    copy.dstOffsets[1] = copy.srcOffsets[1];
+    copy.dstOffset = copy.srcOffset;
+    copy.extent = { width * g.scale, height * g.scale, 1 };
     const VkImage intoImage = into.image;
     Record([=](VkCommandBuffer command) {
-        vkCmdBlitImage(command, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       intoImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy,
-                       VK_FILTER_LINEAR);
+        vkCmdCopyImage(command, sourceImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       intoImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     });
 
     RecordBarrier(into.image, VK_IMAGE_ASPECT_COLOR_BIT,
