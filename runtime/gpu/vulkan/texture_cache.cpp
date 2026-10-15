@@ -1319,11 +1319,15 @@ namespace
         // hash probes and vkFreeDescriptorSets in one unlucky frame.
         // Amortise at most 64 probes/frees per frame, retaining a key rather
         // than an iterator (insertions can rehash unordered_map iterators).
-        constexpr size_t kSweepBudget = 64;
+        // Keep the average probing work near the old one-full-pass-per-64-
+        // frames cadence, rather than scanning even a tiny cache 64 times
+        // more often than before. Cap peak driver frees at 32 per frame.
+        const size_t scanBudget = std::clamp<size_t>(
+            (g.sets.size() + kSweepFrames - 1) / kSweepFrames, 1, 32);
         auto entry = g.nextSetSweepValid ? g.sets.find(g.nextSetSweep)
                                          : g.sets.begin();
         if (entry == g.sets.end()) entry = g.sets.begin();
-        for (size_t examined = 0; examined < kSweepBudget && entry != g.sets.end();
+        for (size_t examined = 0; examined < scanBudget && entry != g.sets.end();
              ++examined)
         {
             if (g.frame - entry->second.lastUsed < kUnusedFrames) { ++entry; continue; }
@@ -1337,7 +1341,9 @@ namespace
         // Retired descriptor sets are appended in frame order. A deque can
         // release just the oldest completed sets without moving all survivors
         // (or freeing thousands on the same frame).
-        for (size_t count = 0; count < kSweepBudget && !g.retiredSets.empty(); ++count)
+        const size_t retireBudget = std::clamp<size_t>(
+            (g.retiredSets.size() + kSweepFrames - 1) / kSweepFrames, 1, 32);
+        for (size_t count = 0; count < retireBudget && !g.retiredSets.empty(); ++count)
         {
             if (g.frame - g.retiredSets.front().lastUsed < kUnusedFrames) break;
             FreeSet(g.retiredSets.front());
