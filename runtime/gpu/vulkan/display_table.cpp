@@ -58,6 +58,9 @@ namespace
         uint32_t next = 0;
 
         uint32_t held[256]{};       // what the table image currently holds
+        uint32_t examined[256]{};   // last palette checked for a neutral LUT
+        bool haveExamined = false;
+        bool neutralTable = false;
         bool haveTable = false;
         uint64_t applied = 0, uploads = 0;
         bool failed = false;
@@ -271,11 +274,35 @@ bool vk::display::Ready() { return g.pipeline != VK_NULL_HANDLE && !g.failed; }
 
 void vk::display::Apply(void* imageHandle, uint32_t width, uint32_t height, int layout)
 {
-    if (!Ready() && !Initialise()) return;
-    VkImage image = static_cast<VkImage>(imageHandle);
-
     uint32_t wanted[256];
     if (!gpu::DisplayColourTable(wanted)) return;
+
+    // A neutral 10-bit colour table rounds back to exactly the incoming
+    // 8-bit channel for all 256 possible values. Applying it is a no-op,
+    // so skip the full-screen compute shader and its image barriers.
+    // Cache the check: the title normally changes its LUT only in menus.
+    if (!g.haveExamined || std::memcmp(wanted, g.examined, sizeof wanted) != 0)
+    {
+        bool neutral = true;
+        for (uint32_t i = 0; i < 256; ++i)
+        {
+            const uint32_t entry = wanted[i];
+            auto quantize = [](uint32_t ten) { return (ten * 255 + 511) / 1023; };
+            if (quantize((entry >> 20) & 0x3FF) != i ||
+                quantize((entry >> 10) & 0x3FF) != i ||
+                quantize(entry & 0x3FF) != i)
+            {
+                neutral = false;
+                break;
+            }
+        }
+        std::memcpy(g.examined, wanted, sizeof wanted);
+        g.haveExamined = true;
+        g.neutralTable = neutral;
+    }
+    if (g.neutralTable) return;
+    if (!Ready() && !Initialise()) return;
+    VkImage image = static_cast<VkImage>(imageHandle);
 
     if (!g.haveTable || std::memcmp(wanted, g.held, sizeof wanted) != 0)
     {
