@@ -259,13 +259,17 @@ namespace vk::renderer::detail
         DrawBatchPool() { spare.reserve(32); }
         std::vector<DrawOp> Acquire()
         {
-            std::lock_guard lock(mutex);
-            if (!spare.empty())
             {
-                auto batch = std::move(spare.back());
-                spare.pop_back();
-                return batch;
+                std::lock_guard lock(mutex);
+                if (!spare.empty())
+                {
+                    auto batch = std::move(spare.back());
+                    spare.pop_back();
+                    return batch;
+                }
             }
+            // Allocate outside the pool lock: the recorder can return another
+            // batch concurrently without being blocked by malloc.
             std::vector<DrawOp> batch;
             batch.reserve(kBufferedDraws);
             return batch;
