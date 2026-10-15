@@ -275,6 +275,12 @@ namespace vk::renderer::detail
         uint32_t segment = 0;          // the current one's index into its slot's buffers
         bool segmentDraws = false;     // a draw has been recorded into it
         uint64_t segments = 0, completions = 0;
+        // Separate from the frame's, for work that cannot go inside one: the first
+        // transition of a render target out of UNDEFINED, and the dumps.
+        VkCommandPool setupCommands = VK_NULL_HANDLE;
+        VkCommandBuffer setup = VK_NULL_HANDLE;
+        VkFence setupFence = VK_NULL_HANDLE;
+
         // One host-visible buffer holding everything a draw reads that is not
         // a texture: constant snapshots, vertex data, index buffers.
         VkBuffer arena = VK_NULL_HANDLE;
