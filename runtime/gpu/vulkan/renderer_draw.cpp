@@ -15,6 +15,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #ifdef MW2_HAVE_VULKAN
@@ -247,17 +248,45 @@ namespace vk::renderer::detail
     // Only the ring-consumer thread appends here. The recorder receives an
     // owning copy of each batch, so no pending draw points at guest memory.
     constexpr size_t kBufferedDraws = 64;
+    // Producer-to-recorder batches keep ownership of their DrawOps until the
+    // Vulkan commands are recorded. Recycle completed vector storage back to
+    // the producer instead of allocating and freeing a 64-draw vector for
+    // every material/pass boundary. Bound the spare pool to avoid idle RAM.
+    struct DrawBatchPool
+    {
+        std::mutex mutex;
+        std::vector<std::vector<DrawOp>> spare;
+        DrawBatchPool() { spare.reserve(32); }
+        std::vector<DrawOp> Acquire()
+        {
+            std::lock_guard lock(mutex);
+            if (!spare.empty())
+            {
+                auto batch = std::move(spare.back());
+                spare.pop_back();
+                return batch;
+            }
+            std::vector<DrawOp> batch;
+            batch.reserve(kBufferedDraws);
+            return batch;
+        }
+        void Recycle(std::vector<DrawOp> batch)
+        {
+            batch.clear();
+            std::lock_guard lock(mutex);
+            if (spare.size() < 32) spare.push_back(std::move(batch));
+        }
+    };
+    DrawBatchPool g_drawBatchPool;
     thread_local std::vector<DrawOp> pendingDraws;
     void FlushDrawBatch()
     {
         if (pendingDraws.empty()) return;
-        // Reuse the producer's capacity instead of allocating a new vector
-        // for each draw group (typically thousands of groups per frame).
         std::vector<DrawOp> batch;
         batch.swap(pendingDraws);
-        if (pendingDraws.capacity() < 64) pendingDraws.reserve(64);
+        pendingDraws = g_drawBatchPool.Acquire();
         // Deliberately bypass Record(): it calls FlushDrawBatch itself.
-        vk::record::Command([batch = std::move(batch)](VkCommandBuffer command) {
+        vk::record::Command([batch = std::move(batch)](VkCommandBuffer command) mutable {
             for (size_t i = 0; i < batch.size();)
             {
                 // Only draw operations with no intervening state changes
@@ -303,6 +332,9 @@ namespace vk::renderer::detail
                 }
                 batch[i++](command);
             }
+            // Executing this after the command loop ensures no draw operation
+            // references the vector while it is available to the producer.
+            g_drawBatchPool.Recycle(std::move(batch));
         });
     }
 
