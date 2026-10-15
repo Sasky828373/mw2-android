@@ -603,7 +603,7 @@ namespace vk::renderer::detail
                          uint32_t guestFormat);
     void DestroyTarget(Target& target);
     // A new target leaves UNDEFINED and is cleared before a pass loads it.
-    void ClearNewTarget(Target& target);
+    bool ClearNewTarget(Target& target);
     // Opens a rendering instance over the two targets (closing the one open,
     // if it is another), with the barriers a render pass's dependencies were.
     void BeginRendering(const Target& colour, const Target& depth, uint32_t width,
