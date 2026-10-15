@@ -559,7 +559,19 @@ namespace
         while (Running())
         {
             DeliverOcclusionQueries();
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            // A genuine GPU/guest handshake can be cleared within a few
+            // microseconds; keep that latency for short waits. Long waits
+            // used to wake the command-processor thread 20,000 times/second
+            // (50 us sleeps), wasting CPU and battery while the guest could
+            // not proceed. Back off only after the request is demonstrably
+            // slow, without reducing render fidelity or altering its timeout.
+            const auto elapsed = waited();
+            const auto pause = elapsed < std::chrono::milliseconds(2)
+                ? std::chrono::microseconds(50)
+                : elapsed < std::chrono::milliseconds(20)
+                    ? std::chrono::microseconds(150)
+                    : std::chrono::microseconds(500);
+            std::this_thread::sleep_for(pause);
             if (matches(current())) { matched = true; break; }
             if (waited() > kTimeout) break;
         }
