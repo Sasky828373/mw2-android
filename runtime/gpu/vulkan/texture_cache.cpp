@@ -57,6 +57,7 @@ void vk::textures::BeginUploads(uint32_t) {}
 #else
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -286,7 +287,10 @@ namespace
 
         uint32_t uploads = 0, failures = 0, descriptorSets = 0;
         uint64_t uploadedBytes = 0;
-        uint64_t liveBytes = 0, budget = 0;   // what the uploaded images hold, and may
+        uint64_t liveBytes = 0;
+        // SetBudget may be called from Android's memory-pressure callback
+        // while the GPU consumer is streaming textures on another thread.
+        std::atomic<uint64_t> budget{ 0 };
         uint64_t evicted = 0, evictedBytes = 0, evictionPasses = 0;
         uint64_t stale = 0, staleBytes = 0;   // released because their memory was rewritten
         uint64_t staleNotReally = 0;          // kept: a page was written, their bytes were not
@@ -1274,7 +1278,7 @@ namespace
 uint64_t vk::textures::FrameNumber() { return g.frame; }
 
 uint64_t vk::textures::LiveBytes() { return g.liveBytes; }
-uint64_t vk::textures::Budget() { return g.budget; }
+uint64_t vk::textures::Budget() { return g.budget.load(std::memory_order_relaxed); }
 
 // A budget the system asked for. The eviction pass is left to the next frame
 // -- it waits for the device, and the caller is whichever thread Android
@@ -1282,7 +1286,7 @@ uint64_t vk::textures::Budget() { return g.budget; }
 void vk::textures::SetBudget(uint64_t bytes)
 {
     const uint64_t floor = 48ull << 20;   // below this nothing would stay cached
-    g.budget = std::max(bytes, floor);
+    g.budget.store(std::max(bytes, floor), std::memory_order_relaxed);
 }
 
 void vk::textures::MemoryWritten(uint32_t physicalAddress, uint32_t size)
@@ -1465,7 +1469,7 @@ namespace
         // entries. A min-heap builds in O(n), then evicts the least-recently
         // used image in O(log n) until the budget is recovered.
         std::make_heap(oldest.begin(), oldest.end(), std::greater<>{});
-        const uint64_t target = g.budget / 4 * 3;
+        const uint64_t target = g.budget.load(std::memory_order_relaxed) / 4 * 3;
         uint64_t count = 0, bytes = 0;
         while (g.liveBytes > target && !oldest.empty())
         {
@@ -1526,7 +1530,8 @@ void vk::textures::NewFrame()
         }
     // Bounded set clean-up every frame avoids periodic allocator spikes.
     SweepSets();
-    if (g.frame % kSweepFrames == 0 && g.liveBytes > g.budget) Evict();
+    if (g.frame % kSweepFrames == 0 &&
+        g.liveBytes > g.budget.load(std::memory_order_relaxed)) Evict();
     SweepImages();
     DestroyDoomed();
 }
