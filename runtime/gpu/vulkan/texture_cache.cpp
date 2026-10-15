@@ -260,7 +260,9 @@ namespace
         Set* hotSet = nullptr;
         // Sets dropped from the cache all at once, which commands not yet run
         // may still bind: freed when they are that old too.
-        std::vector<Set> retiredSets;
+        std::deque<Set> retiredSets;
+        std::array<uint64_t, vk::textures::kSlots> nextSetSweep{};
+        bool nextSetSweepValid = false;
         uint32_t allocPool = 0;   // the pool the last set came from
         // Images nothing names any more, waiting to be destroyed a few a frame.
         std::deque<Image> doomed;
@@ -1047,6 +1049,7 @@ void vk::textures::Shutdown()
     g.byContent.clear();
     g.hotSet = nullptr;
     g.sets.clear();
+    g.nextSetSweepValid = false;
     g.retiredSets.clear();
     g.samplerList.clear();
     g.samplerIndex.clear();
@@ -1303,6 +1306,7 @@ namespace
     void RetireSets()
     {
         g.hotSet = nullptr;
+        g.nextSetSweepValid = false;
         for (const auto& [key, entry] : g.sets)
             g.retiredSets.push_back({ entry.set, entry.pool, g.frame });
         g.sets.clear();
@@ -1310,21 +1314,35 @@ namespace
 
     void SweepSets()
     {
-        // This pass may erase a node that the hot descriptor points to.
-        g.hotSet = nullptr;
-        for (auto entry = g.sets.begin(); entry != g.sets.end();)
+        // Descriptor-set retirement used to visit and destroy *every* stale
+        // entry once every 64 frames. Large levels then paid thousands of
+        // hash probes and vkFreeDescriptorSets in one unlucky frame.
+        // Amortise at most 64 probes/frees per frame, retaining a key rather
+        // than an iterator (insertions can rehash unordered_map iterators).
+        constexpr size_t kSweepBudget = 64;
+        auto entry = g.nextSetSweepValid ? g.sets.find(g.nextSetSweep)
+                                         : g.sets.begin();
+        if (entry == g.sets.end()) entry = g.sets.begin();
+        for (size_t examined = 0; examined < kSweepBudget && entry != g.sets.end();
+             ++examined)
         {
             if (g.frame - entry->second.lastUsed < kUnusedFrames) { ++entry; continue; }
+            if (g.hotSet == &entry->second) g.hotSet = nullptr;
             FreeSet(entry->second);
             entry = g.sets.erase(entry);
         }
-        size_t kept = 0;
-        for (const State::Set& entry : g.retiredSets)
+        g.nextSetSweepValid = entry != g.sets.end();
+        if (g.nextSetSweepValid) g.nextSetSweep = entry->first;
+
+        // Retired descriptor sets are appended in frame order. A deque can
+        // release just the oldest completed sets without moving all survivors
+        // (or freeing thousands on the same frame).
+        for (size_t count = 0; count < kSweepBudget && !g.retiredSets.empty(); ++count)
         {
-            if (g.frame - entry.lastUsed < kUnusedFrames) g.retiredSets[kept++] = entry;
-            else FreeSet(entry);
+            if (g.frame - g.retiredSets.front().lastUsed < kUnusedFrames) break;
+            FreeSet(g.retiredSets.front());
+            g.retiredSets.pop_front();
         }
-        g.retiredSets.resize(kept);
     }
 
     // Whether an image can be let go: one of the cache's own, and unbound for
@@ -1473,11 +1491,9 @@ void vk::textures::NewFrame()
                  (unsigned long long)memory.blocks, (unsigned long long)(memory.blockBytes >> 20),
                  g.sets.size());
         }
-    if (g.frame % kSweepFrames == 0)
-    {
-        SweepSets();
-        if (g.liveBytes > g.budget) Evict();
-    }
+    // Bounded set clean-up every frame avoids periodic allocator spikes.
+    SweepSets();
+    if (g.frame % kSweepFrames == 0 && g.liveBytes > g.budget) Evict();
     SweepImages();
     DestroyDoomed();
 }
