@@ -112,12 +112,20 @@ namespace
                 at += header->bytes;
                 calls++;
                 ++completedInBatch;
-                const bool waiting = q.waiters.load(std::memory_order_acquire) != 0;
-                if (waiting || completedInBatch >= 32 || at == end)
+                // The recorder can issue millions of small Vulkan commands per
+                // second. Sampling the producer/waiter cache line on *every*
+                // command causes avoidable inter-core traffic on ARM64.
+                // Check waiters every 8 calls, publish at 32 or at the end;
+                // a blocked producer is then woken within at most 8 calls.
+                if ((completedInBatch & 7u) == 0 || at == end)
                 {
-                    q.made.store(at, std::memory_order_release);
-                    if (waiting) q.made.notify_all();
-                    completedInBatch = 0;
+                    const bool waiting = q.waiters.load(std::memory_order_acquire) != 0;
+                    if (waiting || completedInBatch >= 32 || at == end)
+                    {
+                        q.made.store(at, std::memory_order_release);
+                        if (waiting) q.made.notify_all();
+                        completedInBatch = 0;
+                    }
                 }
             }
         }
