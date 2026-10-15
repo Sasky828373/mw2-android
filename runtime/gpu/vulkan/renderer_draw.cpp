@@ -696,15 +696,24 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
     // What each slot is declared as, so a texture of another kind is not bound
     // there. The two stages share the set; where both sample a slot the pixel
     // shader's reading wins, and the title has not been seen to disagree.
-    uint8_t kinds[vk::textures::kSlots];
-    for (uint32_t s = 0; s < vk::textures::kSlots; s++)
+    // Keep descriptor-key kinds at their 2D fallback for unused slots.
+    // Previously every draw copied 32 kinds even when its shaders only used
+    // one or two samplers, multiplying redundant descriptor-set variants.
+    uint8_t kinds[vk::textures::kSlots]{};
+    const uint32_t textureMask = vertex->translation.textureMask |
+                                 pixel->translation.textureMask;
+    uint32_t activeKinds = textureMask;
+    while (activeKinds)
+    {
+        const uint32_t s = std::countr_zero(activeKinds);
+        activeKinds &= activeKinds - 1;
         kinds[s] = (pixel->translation.textureMask & (1u << s))
                        ? pixel->translation.textureKinds[s]
                        : vertex->translation.textureKinds[s];
+    }
     uint32_t scaledSlots = 0;
     gpu::detail::SetCurrentDrawStage("Draw_TextureSetFor");
-    VkDescriptorSet textureSet = TextureSetFor(
-        r, vertex->translation.textureMask | pixel->translation.textureMask, kinds, scaledSlots);
+    VkDescriptorSet textureSet = TextureSetFor(r, textureMask, kinds, scaledSlots);
     if (!textureSet) { Skip("no texture descriptor set"); return; }
 
     State::Bound& bound = g.bound;
