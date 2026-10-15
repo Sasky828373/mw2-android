@@ -241,9 +241,12 @@ namespace
         std::unordered_map<std::array<uint32_t, 6>, uint64_t, WordsHash> byContent;
         std::vector<uint64_t> freeIds;                // slots of g.images to use again
         std::vector<VkSampler> samplerList;           // an id's sampler, by its index less one
-        std::map<uint64_t, uint32_t> samplerIndex;    // sampler key -> that index
-        std::map<uint64_t, uint64_t> adopted;         // caller's key -> id
-        std::map<uint64_t, VkSampler> samplers;
+        // Sampler and adopted-resolve lookups happen for almost every textured
+        // draw. No callers depend on ordering; hash tables avoid three separate
+        // red-black-tree walks and improve hot-material locality.
+        std::unordered_map<uint64_t, uint32_t> samplerIndex; // sampler key -> index
+        std::unordered_map<uint64_t, uint64_t> adopted;      // resolve key -> image id
+        std::unordered_map<uint64_t, VkSampler> samplers;    // sampler key -> handle
         // A set, the pool it came from and the frame it was last handed out
         // in: one nothing has bound for kUnusedFrames goes back to its pool.
         struct Set { VkDescriptorSet set; uint32_t pool; uint64_t lastUsed; };
@@ -1047,6 +1050,9 @@ void vk::textures::Shutdown()
     g.retiredSets.clear();
     g.samplerList.clear();
     g.samplerIndex.clear();
+    // Adopted resolved views refer to image slots. If the renderer restarts
+    // after surface/device recreation, their previous one-based IDs are stale.
+    g.adopted.clear();
     DestroyImage(g.fallback);
     DestroyImage(g.fallbackCube);
     DestroyImage(g.fallback3D);

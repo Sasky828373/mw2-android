@@ -205,8 +205,14 @@ namespace vk::renderer::detail
         struct Made { uint32_t address, base, first, dwords; };
         Made made[kFetchSlots];          // every entry is written before it is read
         uint32_t madeCount = 0;
-        for (uint32_t group = 0; group < 32; group++)
+        // Most vertex programs read a sparse subset of the 96 fetch slots.
+        // Visit only groups actually named by the shader, preserving the
+        // original group-first, sub-second ordering for shared vertex copies.
+        uint32_t activeGroups = subs[0] | subs[1] | subs[2];
+        while (activeGroups)
         {
+            const uint32_t group = std::countr_zero(activeGroups);
+            activeGroups &= activeGroups - 1;
             for (uint32_t sub = 0; sub < 3; sub++)
             {
                 if (!(subs[sub] & (1u << group))) continue;
