@@ -75,6 +75,11 @@ static void RollbackInitialise()
     }
     g.arenaBytes = 0;
 
+    if (g.setupFence)
+    {
+        vkDestroyFence(g.device, g.setupFence, nullptr);
+        g.setupFence = VK_NULL_HANDLE;
+    }
     for (State::Slot& slot : g.slots)
     {
         if (slot.fence)
@@ -88,6 +93,12 @@ static void RollbackInitialise()
         vkDestroyQueryPool(g.device, g.guestQueries, nullptr);
         g.guestQueries = VK_NULL_HANDLE;
     }
+    if (g.setupCommands)
+    {
+        vkDestroyCommandPool(g.device, g.setupCommands, nullptr);
+        g.setupCommands = VK_NULL_HANDLE;
+    }
+    g.setup = VK_NULL_HANDLE;
     for (State::Slot& slot : g.slots)
     {
         if (slot.commands)
@@ -222,6 +233,21 @@ bool vk::renderer::Initialise()
         allocate.commandBufferCount = 1;
     }
 
+    VkCommandPoolCreateInfo setupPool{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    setupPool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    setupPool.queueFamilyIndex = vk::pipeline::QueueFamily();
+    if (vkCreateCommandPool(g.device, &setupPool, nullptr, &g.setupCommands) != VK_SUCCESS)
+    {
+        RollbackInitialise();
+        return false;
+    }
+    allocate.commandPool = g.setupCommands;
+    if (vkAllocateCommandBuffers(g.device, &allocate, &g.setup) != VK_SUCCESS)
+    {
+        RollbackInitialise();
+        return false;
+    }
+
     VkQueryPoolCreateInfo queries{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
     queries.queryType = VK_QUERY_TYPE_OCCLUSION;
     queries.queryCount = kGuestQueryRing;
@@ -235,6 +261,12 @@ bool vk::renderer::Initialise()
             RollbackInitialise();
             return false;
         }
+    if (vkCreateFence(g.device, &fence, nullptr, &g.setupFence) != VK_SUCCESS)
+    {
+        RollbackInitialise();
+        return false;
+    }
+
     // Constants, vertex data and indices all live in the arena, which is why
     // it carries every usage at once.
     // Ask for the whole thing and settle for what the device will give: on a
@@ -501,6 +533,10 @@ void vk::renderer::Shutdown()
         if (slot.fence) vkDestroyFence(g.device, slot.fence, nullptr);
         if (slot.commands) vkDestroyCommandPool(g.device, slot.commands, nullptr);
     }
+    if (g.setupFence) vkDestroyFence(g.device, g.setupFence, nullptr);
+
+    if (g.setupCommands) vkDestroyCommandPool(g.device, g.setupCommands, nullptr);
+
     // The handles are gone; the counters stay, because the report is written
     // after the shutdown.
     g.arena = VK_NULL_HANDLE;
@@ -508,6 +544,8 @@ void vk::renderer::Shutdown()
     g.arenaMapped = nullptr;
     g.guestQueries = VK_NULL_HANDLE;
     g.descriptors = VK_NULL_HANDLE;
+    g.setupFence = VK_NULL_HANDLE;
+    g.setupCommands = VK_NULL_HANDLE;
     for (State::Slot& slot : g.slots) slot = State::Slot{};
     g.recording = false;
     g.device = VK_NULL_HANDLE;
