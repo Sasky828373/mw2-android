@@ -263,6 +263,10 @@ namespace
         std::deque<Set> retiredSets;
         std::array<uint64_t, vk::textures::kSlots> nextSetSweep{};
         bool nextSetSweepValid = false;
+        // Image slots must not be recycled while a cached descriptor can
+        // still refer to their old VkImageView. Incremental sweeps may take
+        // more than 64 frames when there are thousands of materials.
+        uint64_t lastFullSetSweepFrame = 0;
         uint32_t allocPool = 0;   // the pool the last set came from
         // Images nothing names any more, waiting to be destroyed a few a frame.
         std::deque<Image> doomed;
@@ -1050,6 +1054,7 @@ void vk::textures::Shutdown()
     g.hotSet = nullptr;
     g.sets.clear();
     g.nextSetSweepValid = false;
+    g.lastFullSetSweepFrame = 0;
     g.retiredSets.clear();
     g.samplerList.clear();
     g.samplerIndex.clear();
@@ -1337,6 +1342,7 @@ namespace
         }
         g.nextSetSweepValid = entry != g.sets.end();
         if (g.nextSetSweepValid) g.nextSetSweep = entry->first;
+        else g.lastFullSetSweepFrame = g.frame;
 
         // Retired descriptor sets are appended in frame order. A deque can
         // release just the oldest completed sets without moving all survivors
@@ -1357,7 +1363,12 @@ namespace
     bool Idle(const Image& image)
     {
         return image.image && !image.borrowed && !image.pinned &&
-               g.frame - image.lastBound >= kUnusedFrames + kSweepFrames;
+               g.frame - image.lastBound >= kUnusedFrames + kSweepFrames &&
+               // A 64-frame age margin alone is insufficient if a large
+               // incremental sweep has not yet reached all cached sets.
+               // Keep the image alive (including its reusable one-based id)
+               // until a whole descriptor scan has completed after expiry.
+               g.lastFullSetSweepFrame >= image.lastBound + kUnusedFrames;
     }
 
     // The image stops existing for the cache now; its Vulkan objects are
