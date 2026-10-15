@@ -25,6 +25,7 @@
 #include "../../stutters.h"
 #include "../../words_hash.h"
 
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <string>
