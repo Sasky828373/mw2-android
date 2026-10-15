@@ -394,13 +394,6 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
         return;
     }
 
-    gpu::detail::SetCurrentDrawStage("Draw_ShaderFor");
-    const Shader* vertex = ShaderFor(shader::Type::Vertex, call.vertexHash,
-                                     call.vertexCode, call.vertexWords);
-    const Shader* pixel = ShaderFor(shader::Type::Pixel, call.pixelHash,
-                                    call.pixelCode, call.pixelWords);
-    if (!vertex || !pixel) { Skip("shader not translated"); return; }
-
     // The colour-and-depth form comes in pairs that describe one row of EDRAM
     // two ways: the bulk of it as a surface half as wide with twice the sample
     // count, the columns left over at the surface's own count, because a tile
@@ -441,6 +434,22 @@ void vk::renderer::Draw(const gpu::RegisterFile& r, const DrawCall& call)
     const uint32_t width = std::min(usePitch, 2048u);
     const uint32_t height = std::clamp(uint32_t(scissor.offset.y) + scissor.extent.height,
                                        32u, maxAllowedHeight);
+
+    // Compute target bounds before shader lookup. Pure EDRAM clear packets
+    // above require no translated shader; draws fully outside this surface
+    // should not compile shaders or allocate Vulkan render targets either.
+    if (scissor.offset.x >= int64_t(width) || scissor.offset.y >= int64_t(height))
+    {
+        Skip("scissor outside surface");
+        return;
+    }
+
+    gpu::detail::SetCurrentDrawStage("Draw_ShaderFor");
+    const Shader* vertex = ShaderFor(shader::Type::Vertex, call.vertexHash,
+                                     call.vertexCode, call.vertexWords);
+    const Shader* pixel = ShaderFor(shader::Type::Pixel, call.pixelHash,
+                                    call.pixelCode, call.pixelWords);
+    if (!vertex || !pixel) { Skip("shader not translated"); return; }
 
     gpu::detail::SetCurrentDrawStage("Draw_EnsureTarget");
     Target* colourTarget = EnsureTarget({ colour.BaseTile(), usePitch,
