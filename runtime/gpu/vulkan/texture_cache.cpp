@@ -239,6 +239,16 @@ namespace
         // held once.
         std::unordered_map<std::array<uint32_t, 6>, uint64_t, WordsHash> byFetch;
         std::unordered_map<std::array<uint32_t, 6>, uint64_t, WordsHash> byContent;
+        // A draw generally binds the same few material fetches repeatedly.
+        // Keep four hot six-dword lookups inline to skip hash probing while
+        // still refreshing dynamic guest texture contents on every bind.
+        struct HotFetch {
+            std::array<uint32_t, 6> key{};
+            uint64_t id = 0;
+            bool valid = false;
+        };
+        std::array<HotFetch, 4> hotFetch{};
+        uint32_t nextHotFetch = 0;
         std::vector<uint64_t> freeIds;                // slots of g.images to use again
         std::vector<VkSampler> samplerList;           // an id's sampler, by its index less one
         // Sampler and adopted-resolve lookups happen for almost every textured
@@ -1051,6 +1061,8 @@ void vk::textures::Shutdown()
     g.freeIds.clear();
     g.byFetch.clear();
     g.byContent.clear();
+    g.hotFetch = {};
+    g.nextHotFetch = 0;
     g.hotSet = nullptr;
     g.sets.clear();
     g.nextSetSweepValid = false;
@@ -1375,6 +1387,10 @@ namespace
     // destroyed over the next frames (DestroyDoomed).
     void Release(uint64_t id)
     {
+        // A recycled one-based id may now refer to a different VkImageView.
+        // Drop any hot fetch whose image slot is being evicted.
+        for (auto& hot : g.hotFetch)
+            if (hot.valid && (hot.id & kImageBits) == id) hot.valid = false;
         Image& image = g.images[size_t(id - 1)];
         for (const auto& name : image.names)
             if (auto entry = g.byFetch.find(name);
@@ -1601,16 +1617,29 @@ uint64_t vk::textures::Upload(const gpu::TextureFetch& fetch, const char** error
 
     std::array<uint32_t, 6> key{};
     for (uint32_t i = 0; i < 6; i++) key[i] = fetch.d[i];
-    auto found = g.byFetch.find(key);
-    if (found != g.byFetch.end())
-    {
-        if (Image* image = Find(found->second))
+    const auto bindCached = [&](uint64_t id) -> uint64_t {
+        if (Image* image = Find(id))
         {
             image->lastBound = g.frame;
             image->boundSegment = g.segment;
         }
-        RefreshIfChanged(found->second & kImageBits);
-        return found->second;
+        // Fast lookup must never omit write-watch / signature invalidation:
+        // textures can be rewritten in guest RAM with the same fetch words.
+        RefreshIfChanged(id & kImageBits);
+        return id;
+    };
+    const auto remember = [&](uint64_t id) {
+        auto& hot = g.hotFetch[g.nextHotFetch++ % g.hotFetch.size()];
+        hot = { key, id, true };
+    };
+    for (const auto& hot : g.hotFetch)
+        if (hot.valid && hot.key == key)
+            return bindCached(hot.id);
+    auto found = g.byFetch.find(key);
+    if (found != g.byFetch.end())
+    {
+        remember(found->second);
+        return bindCached(found->second);
     }
 
     // The same texture under another sampler state: the image is held already.
@@ -1625,7 +1654,10 @@ uint64_t vk::textures::Upload(const gpu::TextureFetch& fetch, const char** error
         image.names.push_back(key);
         g.shared++;
         RefreshIfChanged(held->second);
-        return g.byFetch[key] = held->second | (uint64_t(sampler) << kSamplerShift);
+        const uint64_t named = held->second | (uint64_t(sampler) << kSamplerShift);
+        g.byFetch[key] = named;
+        remember(named);
+        return named;
     }
 
     stutters::Timed timed(stutters::kNewTextures);
@@ -1671,6 +1703,7 @@ uint64_t vk::textures::Upload(const gpu::TextureFetch& fetch, const char** error
     // A failure is cached too: the same six dwords fail the same way, and a
     // texture bound every frame would otherwise fail thousands of times.
     g.byFetch[key] = named;
+    remember(named);
     return named;
 }
 
